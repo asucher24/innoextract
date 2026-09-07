@@ -33,6 +33,12 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build
 
+    - name: Upload innoextract artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: innoextract-linux
+        path: ${{github.workspace}}/build/innoextract
+
     - name: Check Style
       run: cmake --build ${{github.workspace}}/build --target style
 
