@@ -88,40 +88,37 @@ jobs:
         PKGROOT="${PWD}/package"
         LIBDIR="${PKGROOT}/usr/lib/innoextract"
 
-        rm -rf "$PKGROOT"
         mkdir -p \
           "${PKGROOT}/DEBIAN" \
           "${PKGROOT}/usr/bin" \
           "$LIBDIR"
 
         cp build/innoextract "${PKGROOT}/usr/bin/innoextract"
-
         chmod 0755 "${PKGROOT}/usr/bin/innoextract"
 
-        echo "Collecting shared library dependencies..."
+        echo "Dependencies:"
+        ldd build/innoextract
 
-        ldd build/innoextract | \
-          awk '/=> \// {print $3} /^\// {print $1}' | \
+        ldd build/innoextract |
+          awk '/=> \// {print $3}' |
           sort -u > /tmp/dependencies.txt
-
-        cat /tmp/dependencies.txt
 
         while read -r LIB; do
           case "$LIB" in
             /lib/x86_64-linux-gnu/libc.so.*)
-              echo "Skipping glibc: $LIB"
+              echo "Skipping system library: $LIB"
               ;;
             /lib/x86_64-linux-gnu/libm.so.*)
-              echo "Skipping libm: $LIB"
+              echo "Skipping system library: $LIB"
               ;;
             /lib/x86_64-linux-gnu/libdl.so.*)
-              echo "Skipping libdl: $LIB"
+              echo "Skipping system library: $LIB"
               ;;
             /lib/x86_64-linux-gnu/libpthread.so.*)
-              echo "Skipping libpthread: $LIB"
+              echo "Skipping system library: $LIB"
               ;;
             /lib/x86_64-linux-gnu/librt.so.*)
-              echo "Skipping librt: $LIB"
+              echo "Skipping system library: $LIB"
               ;;
             /lib64/ld-linux-x86-64.so.*)
               echo "Skipping dynamic linker: $LIB"
@@ -137,9 +134,10 @@ jobs:
           --set-rpath /usr/lib/innoextract \
           "${PKGROOT}/usr/bin/innoextract"
 
+        echo
         echo "Bundled libraries:"
         ls -la "$LIBDIR"
-
+        
     - name: Create Debian control file
       shell: bash
       run: |
