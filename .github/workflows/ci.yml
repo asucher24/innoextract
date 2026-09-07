@@ -8,15 +8,15 @@ on:
   schedule:
     - cron: '21 11 * * 5'
 
+env:
+  DEBUG: on
+  DEBUG_EXTRA: on
+
 jobs:
 
   linux:
     name: Linux build
     runs-on: ubuntu-latest
-    env:
-      CMAKE_BUILD_TYPE: Debug
-      DEBUG: on
-      DEBUG_EXTRA: on
 
     steps:
     - uses: actions/checkout@v4
@@ -25,43 +25,163 @@ jobs:
       run: sudo apt-get update
 
     - name: Dependencies
-      run: sudo apt-get install build-essential cmake libboost-all-dev liblzma-dev
+      run: |
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libboost-all-dev \
+          liblzma-dev
 
     - name: Configure
-      run: cmake --version && cmake -B ${{github.workspace}}/build -Werror=dev -Werror=deprecated -DCONTINUOUS_INTEGRATION=1
+      run: |
+        cmake \
+          -B ${{ github.workspace }}/build \
+          -Werror=dev \
+          -Werror=deprecated \
+          -DCONTINUOUS_INTEGRATION=1
 
     - name: Build
-      run: cmake --build ${{github.workspace}}/build
-
-    - name: Upload innoextract artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: innoextract-linux
-        path: ${{github.workspace}}/build/innoextract
+      run: cmake --build ${{ github.workspace }}/build --parallel
 
     - name: Check Style
-      run: cmake --build ${{github.workspace}}/build --target style
+      run: cmake --build ${{ github.workspace }}/build --target style
 
-  macos:
-    name: macOS build
-    runs-on: macos-latest
+    - name: Upload build
+      uses: actions/upload-artifact@v4
+      with:
+        name: innoextract-build
+        path: ${{ github.workspace }}/build/innoextract
+
+
+  package:
+    name: Build Debian package
+    runs-on: ubuntu-latest
+    needs: linux
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Update
-      run: brew update
+    - name: Download binary
+      uses: actions/download-artifact@v4
+      with:
+        name: innoextract-build
+        path: build
 
-    - name: Workaround for Python install isssues - https://github.com/actions/runner-images/issues/8838
-      run: brew install python@3 || brew link --overwrite python@3
+    - name: Install packaging tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          dpkg-dev \
+          patchelf \
+          file
 
-    - name: Dependencies
-      env:
-        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
-      run: brew install boost xz
+    - name: Inspect binary
+      run: |
+        file build/innoextract
+        ldd build/innoextract
 
-    - name: Configure
-      run: cmake --version && cmake -B ${{github.workspace}}/build -Werror=dev -Werror=deprecated -DCONTINUOUS_INTEGRATION=1
+    - name: Prepare package
+      shell: bash
+      run: |
+        set -euo pipefail
 
-    - name: Build
-      run: cmake --build ${{github.workspace}}/build
+        PKGROOT="${PWD}/package"
+        LIBDIR="${PKGROOT}/usr/lib/innoextract"
+
+        rm -rf "$PKGROOT"
+        mkdir -p \
+          "${PKGROOT}/DEBIAN" \
+          "${PKGROOT}/usr/bin" \
+          "$LIBDIR"
+
+        cp build/innoextract "${PKGROOT}/usr/bin/innoextract"
+
+        chmod 0755 "${PKGROOT}/usr/bin/innoextract"
+
+        echo "Collecting shared library dependencies..."
+
+        ldd build/innoextract | \
+          awk '/=> \// {print $3} /^\// {print $1}' | \
+          sort -u > /tmp/dependencies.txt
+
+        cat /tmp/dependencies.txt
+
+        while read -r LIB; do
+          case "$LIB" in
+            /lib/x86_64-linux-gnu/libc.so.*)
+              echo "Skipping glibc: $LIB"
+              ;;
+            /lib/x86_64-linux-gnu/libm.so.*)
+              echo "Skipping libm: $LIB"
+              ;;
+            /lib/x86_64-linux-gnu/libdl.so.*)
+              echo "Skipping libdl: $LIB"
+              ;;
+            /lib/x86_64-linux-gnu/libpthread.so.*)
+              echo "Skipping libpthread: $LIB"
+              ;;
+            /lib/x86_64-linux-gnu/librt.so.*)
+              echo "Skipping librt: $LIB"
+              ;;
+            /lib64/ld-linux-x86-64.so.*)
+              echo "Skipping dynamic linker: $LIB"
+              ;;
+            *)
+              echo "Bundling: $LIB"
+              cp -L "$LIB" "$LIBDIR/"
+              ;;
+          esac
+        done < /tmp/dependencies.txt
+
+        patchelf \
+          --set-rpath /usr/lib/innoextract \
+          "${PKGROOT}/usr/bin/innoextract"
+
+        echo "Bundled libraries:"
+        ls -la "$LIBDIR"
+
+    - name: Create Debian control file
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
+        ARCH="$(dpkg --print-architecture)"
+
+        cat > package/DEBIAN/control <<EOF
+        Package: innoextract
+        Version: ${VERSION}
+        Section: utils
+        Priority: optional
+        Architecture: ${ARCH}
+        Maintainer: innoextract CI
+        Description: Tool for extracting installers created by Inno Setup
+         innoextract extracts files from installers created by Inno Setup.
+        EOF
+
+    - name: Build Debian package
+      run: |
+        dpkg-deb --build --root-owner-group \
+          package \
+          innoextract_0.0.0+git${GITHUB_RUN_NUMBER}_$(dpkg --print-architecture).deb
+
+    - name: Verify Debian package
+      run: |
+        dpkg-deb --info innoextract_*.deb
+        dpkg-deb --contents innoextract_*.deb
+
+    - name: Test package installation
+      run: |
+        sudo apt-get install -y ./innoextract_*.deb
+
+        echo "Installed binary:"
+        command -v innoextract
+
+        echo "Testing:"
+        innoextract --debug --help
+
+    - name: Upload Debian package
+      uses: actions/upload-artifact@v4
+      with:
+        name: innoextract-deb
+        path: innoextract_*.deb
