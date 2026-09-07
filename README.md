@@ -51,8 +51,8 @@ The default build settings are tuned for users - if you plan to make changes to 
 | `USE_LZMA`                | `ON`      | Use `liblzma`.
 | `WITH_CONV`               | *not set* | The charset conversion library to use. Valid values are `iconv`, `win32` and `builtin`¹. If not set, a library appropriate for the target platform will be chosen.
 | `CMAKE_BUILD_TYPE`        | `Release` | Set to `Debug` to enable debug output.
-| `DEBUG`                   | `OFF`²    | Enable debug output and runtime checks.
-| `DEBUG_EXTRA`             | `OFF`     | Expensive debug options.
+| `DEBUG`                   | `ON`²    | Enable debug output and runtime checks.
+| `DEBUG_EXTRA`             | `ON`     | Expensive debug options.
 | `SET_WARNING_FLAGS`       | `ON`      | Adjust compiler warning flags. This should not affect the produced binaries but is useful to catch potential problems.
 | `SET_NOISY_WARNING_FLAGS` | `OFF`     | Enable warnings with false positives many cases that still need to be fixed.
 | `SET_OPTIMIZATION_FLAGS`  | `ON`      | Adjust compiler optimization flags.
