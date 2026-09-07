@@ -13,6 +13,9 @@ jobs:
   linux:
     name: Linux build
     runs-on: ubuntu-latest
+    env:
+      DEBUG: on
+      DEBUG_EXTRA: on
 
     steps:
     - uses: actions/checkout@v4
