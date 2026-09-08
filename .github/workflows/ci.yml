@@ -16,7 +16,7 @@ jobs:
 
   linux:
     name: Linux build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v4
@@ -35,26 +35,32 @@ jobs:
     - name: Configure
       run: |
         cmake \
-          -B ${{ github.workspace }}/build \
+          -B "${{ github.workspace }}/build" \
           -Werror=dev \
           -Werror=deprecated \
           -DCONTINUOUS_INTEGRATION=1
 
     - name: Build
-      run: cmake --build ${{ github.workspace }}/build --parallel
+      run: |
+        cmake \
+          --build "${{ github.workspace }}/build" \
+          --parallel
 
     - name: Check Style
-      run: cmake --build ${{ github.workspace }}/build --target style
+      run: |
+        cmake \
+          --build "${{ github.workspace }}/build" \
+          --target style
 
-    - name: Upload build
+    - name: Upload binary
       uses: actions/upload-artifact@v4
       with:
-        name: innoextract-build
+        name: innoextract-binary
         path: ${{ github.workspace }}/build/innoextract
 
 
   package:
-    name: Build Debian package
+    name: Debian package
     runs-on: ubuntu-latest
     needs: linux
 
@@ -64,7 +70,7 @@ jobs:
     - name: Download binary
       uses: actions/download-artifact@v4
       with:
-        name: innoextract-build
+        name: innoextract-binary
         path: build
 
     - name: Install packaging tools
@@ -73,11 +79,14 @@ jobs:
         sudo apt-get install -y \
           dpkg-dev \
           patchelf \
-          file
+          file \
+          binutils
 
-    - name: Inspect binary
+    - name: Show binary dependencies
       run: |
         file build/innoextract
+        echo
+        echo "Dependencies:"
         ldd build/innoextract
 
     - name: Prepare package
@@ -88,98 +97,163 @@ jobs:
         PKGROOT="${PWD}/package"
         LIBDIR="${PKGROOT}/usr/lib/innoextract"
 
+        rm -rf "$PKGROOT"
+
         mkdir -p \
           "${PKGROOT}/DEBIAN" \
           "${PKGROOT}/usr/bin" \
           "$LIBDIR"
 
-        cp build/innoextract "${PKGROOT}/usr/bin/innoextract"
-        chmod 0755 "${PKGROOT}/usr/bin/innoextract"
+        cp build/innoextract \
+          "${PKGROOT}/usr/bin/innoextract"
 
-        echo "Dependencies:"
+        chmod 0755 \
+          "${PKGROOT}/usr/bin/innoextract"
+
+        echo "Collecting runtime libraries..."
+
         ldd build/innoextract
 
         ldd build/innoextract |
-          awk '/=> \// {print $3}' |
+          awk '/=> \// { print $3 }' |
           sort -u > /tmp/dependencies.txt
 
+        echo
+        echo "Libraries to inspect:"
+        cat /tmp/dependencies.txt
+
         while read -r LIB; do
+
           case "$LIB" in
+
+            # Do NOT bundle glibc.
             /lib/x86_64-linux-gnu/libc.so.*)
-              echo "Skipping system library: $LIB"
+              echo "System library, not bundling: $LIB"
               ;;
+
             /lib/x86_64-linux-gnu/libm.so.*)
-              echo "Skipping system library: $LIB"
+              echo "System library, not bundling: $LIB"
               ;;
+
             /lib/x86_64-linux-gnu/libdl.so.*)
-              echo "Skipping system library: $LIB"
+              echo "System library, not bundling: $LIB"
               ;;
+
             /lib/x86_64-linux-gnu/libpthread.so.*)
-              echo "Skipping system library: $LIB"
+              echo "System library, not bundling: $LIB"
               ;;
+
             /lib/x86_64-linux-gnu/librt.so.*)
-              echo "Skipping system library: $LIB"
+              echo "System library, not bundling: $LIB"
               ;;
+
+            /lib/x86_64-linux-gnu/libgcc_s.so.*)
+              echo "System library, not bundling: $LIB"
+              ;;
+
+            /lib/x86_64-linux-gnu/libstdc++.so.*)
+              echo "System library, not bundling: $LIB"
+              ;;
+
             /lib64/ld-linux-x86-64.so.*)
-              echo "Skipping dynamic linker: $LIB"
+              echo "Dynamic loader, not bundling: $LIB"
               ;;
+
             *)
               echo "Bundling: $LIB"
               cp -L "$LIB" "$LIBDIR/"
               ;;
+
           esac
+
         done < /tmp/dependencies.txt
+
+        echo
+        echo "Bundled libraries:"
+        ls -lah "$LIBDIR"
+
+        echo
+        echo "Setting RPATH..."
 
         patchelf \
           --set-rpath /usr/lib/innoextract \
           "${PKGROOT}/usr/bin/innoextract"
 
         echo
-        echo "Bundled libraries:"
-        ls -la "$LIBDIR"
-        
+        echo "RPATH:"
+        patchelf \
+          --print-rpath \
+          "${PKGROOT}/usr/bin/innoextract"
+
     - name: Create Debian control file
       shell: bash
       run: |
         set -euo pipefail
 
         VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
-        ARCH="$(dpkg --print-architecture)"
 
         cat > package/DEBIAN/control <<EOF
         Package: innoextract
         Version: ${VERSION}
         Section: utils
         Priority: optional
-        Architecture: ${ARCH}
+        Architecture: amd64
         Maintainer: innoextract CI
-        Description: Tool for extracting installers created by Inno Setup
+        Description: Tool for extracting Inno Setup installers
          innoextract extracts files from installers created by Inno Setup.
         EOF
 
     - name: Build Debian package
+      shell: bash
       run: |
-        dpkg-deb --build --root-owner-group \
-          package \
-          innoextract_0.0.0+git${GITHUB_RUN_NUMBER}_$(dpkg --print-architecture).deb
+        set -euo pipefail
 
-    - name: Verify Debian package
+        VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
+
+        dpkg-deb \
+          --build \
+          --root-owner-group \
+          package \
+          "innoextract_${VERSION}_amd64.deb"
+
+    - name: Inspect Debian package
       run: |
+        echo "Package information:"
         dpkg-deb --info innoextract_*.deb
+
+        echo
+        echo "Package contents:"
         dpkg-deb --contents innoextract_*.deb
 
-    - name: Test package installation
+    - name: Test package in clean Ubuntu
       run: |
-        sudo apt-get install -y ./innoextract_*.deb
+        docker run --rm \
+          -v "${PWD}:/work" \
+          ubuntu:22.04 \
+          bash -c '
+            set -e
 
-        echo "Installed binary:"
-        command -v innoextract
+            apt-get update
+            apt-get install -y ca-certificates
 
-        echo "Testing:"
-        innoextract --debug --help
+            echo "Installing innoextract package..."
+            apt-get install -y /work/innoextract_*.deb
+
+            echo
+            echo "Installed binary:"
+            command -v innoextract
+
+            echo
+            echo "Checking dependencies:"
+            ldd /usr/bin/innoextract
+
+            echo
+            echo "Testing innoextract:"
+            innoextract --debug --help
+          '
 
     - name: Upload Debian package
       uses: actions/upload-artifact@v4
       with:
-        name: innoextract-deb
+        name: innoextract-debian-amd64
         path: innoextract_*.deb
