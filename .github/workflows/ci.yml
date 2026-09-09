@@ -135,7 +135,7 @@ jobs:
 
           ./bootstrap.sh \
             --prefix="${BOOST_PREFIX}" \
-            --with-libraries=filesystem,iostreams,program_options,date_time
+            --with-libraries=system,filesystem,iostreams,program_options,date_time
 
           ./b2 \
             -j"$(nproc)" \
@@ -151,10 +151,26 @@ jobs:
 
           find "${BOOST_PREFIX}/lib" \
             -maxdepth 1 \
-            -type f \
-            -name 'libboost*.so*' \
+            \( -name 'libboost_system.so*' \
+               -o -name 'libboost_filesystem.so*' \
+               -o -name 'libboost_iostreams.so*' \
+               -o -name 'libboost_program_options.so*' \
+               -o -name 'libboost_date_time.so*' \) \
             -print \
             | sort
+
+          echo
+          echo "========================================"
+          echo "Verify required Boost libraries"
+          echo "========================================"
+
+          test -f "${BOOST_PREFIX}/lib/libboost_system.so.1.83.0"
+          test -f "${BOOST_PREFIX}/lib/libboost_filesystem.so.1.83.0"
+          test -f "${BOOST_PREFIX}/lib/libboost_iostreams.so.1.83.0"
+          test -f "${BOOST_PREFIX}/lib/libboost_program_options.so.1.83.0"
+          test -f "${BOOST_PREFIX}/lib/libboost_date_time.so.1.83.0"
+
+          echo "All required Boost libraries exist."
 
       - name: Configure CMake
         run: |
@@ -172,6 +188,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCONTINUOUS_INTEGRATION=1 \
             -DBOOST_ROOT=/opt/boost \
+            -DBOOST_LIBRARYDIR=/opt/boost/lib \
             -DBoost_NO_BOOST_CMAKE=ON
 
       - name: Build
@@ -214,19 +231,15 @@ jobs:
           file "${BINARY}"
 
           echo
-          echo "Compiler:"
-          g++ --version
-
-          echo
           echo "Runtime dependencies:"
           ldd "${BINARY}"
 
-      - name: Create Debian package
+      - name: Create Debian package directory
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Create Debian package"
+          echo "Create Debian package directory"
           echo "========================================"
 
           PACKAGE_ROOT="/tmp/innoextract-package"
@@ -244,17 +257,24 @@ jobs:
             "${GITHUB_WORKSPACE}/build/innoextract" \
             "${INSTALL_ROOT}/bin/innoextract"
 
-          echo
+      - name: Bundle runtime libraries
+        run: |
+          set -euo pipefail
+
           echo "========================================"
-          echo "Collect runtime libraries"
+          echo "Bundle runtime libraries"
           echo "========================================"
+
+          PACKAGE_ROOT="/tmp/innoextract-package"
+          LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
 
           copy_library() {
             local library="$1"
 
             if [ ! -f "${library}" ]; then
+              echo
               echo "ERROR: Runtime library does not exist:"
-              echo "  ${library}"
+              echo "${library}"
               exit 1
             fi
 
@@ -265,10 +285,13 @@ jobs:
           }
 
           copy_library \
-            "/opt/boost/lib/libboost_iostreams.so.1.83.0"
+            "/opt/boost/lib/libboost_system.so.1.83.0"
 
           copy_library \
             "/opt/boost/lib/libboost_filesystem.so.1.83.0"
+
+          copy_library \
+            "/opt/boost/lib/libboost_iostreams.so.1.83.0"
 
           copy_library \
             "/opt/boost/lib/libboost_program_options.so.1.83.0"
@@ -289,11 +312,53 @@ jobs:
           copy_library "${LZMA_LIBRARY}"
 
           echo
+          echo "Bundled libraries:"
+          find "${LIB_ROOT}" \
+            -maxdepth 1 \
+            -type f \
+            -printf '%f\n' \
+            | sort
+
+      - name: Bundle compiler runtime libraries
+        run: |
+          set -euo pipefail
+
           echo "========================================"
-          echo "Bundled libraries"
+          echo "Bundle compiler runtime libraries"
           echo "========================================"
 
-          ls -lh "${LIB_ROOT}"
+          PACKAGE_ROOT="/tmp/innoextract-package"
+          LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
+
+          copy_library() {
+            local library="$1"
+
+            if [ ! -f "${library}" ]; then
+              echo
+              echo "ERROR: Runtime library does not exist:"
+              echo "${library}"
+              exit 1
+            fi
+
+            echo "Bundling:"
+            echo "  ${library}"
+
+            cp -L "${library}" "${LIB_ROOT}/"
+          }
+
+          LIBSTDCPP="$(
+            g++ -print-file-name=libstdc++.so.6
+          )"
+
+          LIBGCC="$(
+            gcc -print-file-name=libgcc_s.so.1
+          )"
+
+          copy_library "${LIBSTDCPP}"
+          copy_library "${LIBGCC}"
+
+          echo
+          echo "Compiler runtime libraries bundled."
 
       - name: Set RPATH
         run: |
@@ -332,7 +397,7 @@ jobs:
           Architecture: amd64
           Maintainer: innoextract
           Description: Extract files from Inno Setup installers
-           Debug build of innoextract with bundled Boost and LZMA runtime libraries.
+           Debug build of innoextract with bundled runtime dependencies.
           EOF
 
           echo "Package version: ${VERSION}"
@@ -360,37 +425,27 @@ jobs:
           echo "Created package:"
           ls -lh "${PACKAGE}"
 
-      - name: Verify package contents
+      - name: Inspect Debian package
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Verify package contents"
+          echo "Inspect Debian package"
           echo "========================================"
 
-          mapfile -t PACKAGES < <(
+          PACKAGE="$(
             find "${GITHUB_WORKSPACE}/ci-output" \
               -maxdepth 1 \
               -type f \
               -name '*.deb' \
               -print
-          )
+          )"
 
-          if [ "${#PACKAGES[@]}" -ne 1 ]; then
-            echo "ERROR: Expected exactly one .deb package."
-            echo "Found: ${#PACKAGES[@]}"
-
-            find "${GITHUB_WORKSPACE}/ci-output" \
-              -maxdepth 2 \
-              -printf '%p\n'
-
+          if [ -z "${PACKAGE}" ]; then
+            echo "ERROR: No Debian package found."
+            find "${GITHUB_WORKSPACE}/ci-output" -maxdepth 2 -ls
             exit 1
           fi
-
-          PACKAGE="${PACKAGES[0]}"
-
-          echo "Package:"
-          echo "${PACKAGE}"
 
           echo
           echo "Package metadata:"
@@ -400,12 +455,12 @@ jobs:
           echo "Package contents:"
           dpkg-deb -c "${PACKAGE}"
 
-      - name: Test packaged binary
+      - name: Test package without installing dependencies
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Test packaged binary"
+          echo "Test package without external dependencies"
           echo "========================================"
 
           PACKAGE="$(
@@ -429,28 +484,11 @@ jobs:
           BINARY="${TEST_ROOT}/usr/bin/innoextract"
 
           echo
-          echo "========================================"
-          echo "Bundled libraries"
-          echo "========================================"
-
-          find "${TEST_ROOT}/usr/lib/innoextract" \
-            -maxdepth 1 \
-            -type f \
-            -printf '%f\n' \
-            | sort
-
-          echo
-          echo "========================================"
-          echo "RPATH"
-          echo "========================================"
-
+          echo "RPATH:"
           patchelf --print-rpath "${BINARY}"
 
           echo
-          echo "========================================"
-          echo "Runtime dependencies"
-          echo "========================================"
-
+          echo "Runtime dependencies:"
           ldd "${BINARY}"
 
           if ldd "${BINARY}" | grep -q "not found"; then
@@ -463,10 +501,7 @@ jobs:
           echo "All runtime libraries found."
 
           echo
-          echo "========================================"
-          echo "Run packaged binary"
-          echo "========================================"
-
+          echo "Binary test:"
           "${BINARY}" --help >/dev/null
 
           echo "Packaged binary works."
@@ -479,21 +514,16 @@ jobs:
           echo "Final artifact check"
           echo "========================================"
 
-          echo "Workspace:"
-          echo "${GITHUB_WORKSPACE}"
-
-          echo
-          echo "ci-output:"
+          echo "Output directory:"
           ls -lah "${GITHUB_WORKSPACE}/ci-output"
 
           echo
-          echo "Debian packages:"
+          echo "Files:"
 
           find "${GITHUB_WORKSPACE}/ci-output" \
             -maxdepth 1 \
             -type f \
-            -name '*.deb' \
-            -exec ls -lh {} \;
+            -printf '%f\n'
 
           COUNT="$(
             find "${GITHUB_WORKSPACE}/ci-output" \
@@ -504,15 +534,24 @@ jobs:
           )"
 
           if [ "${COUNT}" -ne 1 ]; then
+            echo
             echo "ERROR: Expected exactly one Debian package."
             echo "Found: ${COUNT}"
+
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 2 \
+              -ls
+
             exit 1
           fi
+
+          echo
+          echo "Exactly one Debian package found."
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
         with:
           name: innoextract-debian10-debug
-          path: ci-output/*.deb
+          path: ${{ github.workspace }}/ci-output/*.deb
           if-no-files-found: error
           retention-days: 30
