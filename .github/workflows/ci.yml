@@ -2,261 +2,607 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [ master ]
   pull_request:
-    branches: [master]
+    branches: [ master ]
   schedule:
-    - cron: "21 11 * * 5"
+    - cron: '21 11 * * 5'
 
 env:
   DEBUG: on
   DEBUG_EXTRA: on
-  CMAKE_BUILD_TYPE: Debug
 
 jobs:
-  build-debian10:
-    name: Build Debian package on Debian 10
+
+  linux:
+    name: Linux build and Debian package
     runs-on: ubuntu-latest
-    container:
-      image: debian:10
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Configure Debian 10 APT archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf "%s\n" \
-            "deb http://archive.debian.org/debian buster main" \
-            "deb http://archive.debian.org/debian-security buster/updates main" \
-            > /etc/apt/sources.list
-          printf "%s\n" 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
+
+    # ============================================================
+    # Build everything inside Debian 10.
+    #
+    # This is important because the resulting binary will then
+    # use the old Debian 10 glibc and should therefore also work
+    # on newer Linux distributions.
+    # ============================================================
+
+    - name: Build Debian package
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        mkdir -p "${PWD}/ci-output"
+
+        docker run --rm \
+          --user root \
+          -e DEBUG="${DEBUG}" \
+          -e DEBUG_EXTRA="${DEBUG_EXTRA}" \
+          -v "${PWD}:/src" \
+          -w /src \
+          debian:10 \
+          bash -euxo pipefail -c '
+
+            export DEBIAN_FRONTEND=noninteractive
+
+            echo "========================================"
+            echo "Debian version"
+            echo "========================================"
+
+            cat /etc/os-release
+
+            echo
+            echo "========================================"
+            echo "Configure Debian 10 repositories"
+            echo "========================================"
+
+            # Debian 10 (buster) is EOL.
+            # Its packages are therefore available from the
+            # Debian archive instead of the normal mirrors.
+
+            cat > /etc/apt/sources.list <<EOF
+            deb http://archive.debian.org/debian buster main contrib non-free
+            deb http://archive.debian.org/debian-security buster/updates main contrib non-free
+            EOF
+
+            cat > /etc/apt/apt.conf.d/99archive <<EOF
+            Acquire::Check-Valid-Until "false";
+            EOF
+
+            apt-get update
+
+            echo
+            echo "========================================"
+            echo "Install build dependencies"
+            echo "========================================"
+
+            apt-get install -y \
+              build-essential \
+              cmake \
+              git \
+              wget \
+              ca-certificates \
+              xz-utils \
+              bzip2 \
+              tar \
+              dpkg-dev \
+              file \
+              patchelf \
+              pax-utils \
+              pkg-config \
+              liblzma-dev \
+              zlib1g-dev \
+              libbz2-dev \
+              libzstd-dev
+
+            echo
+            echo "========================================"
+            echo "Tool versions"
+            echo "========================================"
+
+            cmake --version
+            gcc --version
+            g++ --version
+            dpkg --version
+
+            echo
+            echo "DEBUG=${DEBUG}"
+            echo "DEBUG_EXTRA=${DEBUG_EXTRA}"
+
+
+            # ====================================================
+            # Build Boost 1.83.0
+            # ====================================================
+
+            BOOST_VERSION="1.83.0"
+            BOOST_VERSION_UNDERSCORE="1_83_0"
+
+            echo
+            echo "========================================"
+            echo "Build Boost ${BOOST_VERSION}"
+            echo "========================================"
+
+            cd /tmp
+
+            wget \
+              "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.bz2" \
+              -O boost.tar.bz2
+
+            tar \
+              -xjf boost.tar.bz2
+
+            cd "boost_${BOOST_VERSION_UNDERSCORE}"
+
+            ./bootstrap.sh \
+              --prefix=/opt/boost
+
+            ./b2 \
+              -j"$(nproc)" \
+              --prefix=/opt/boost \
+              --with-iostreams \
+              --with-filesystem \
+              --with-program_options \
+              link=shared \
+              runtime-link=shared \
+              install
+
+            echo
+            echo "Boost installation:"
+            find /opt/boost -maxdepth 3 -type f | sort
+
+
+            # ====================================================
+            # Configure and build innoextract
+            # ====================================================
+
+            echo
+            echo "========================================"
+            echo "Configure innoextract"
+            echo "========================================"
+
+            cd /src
+
+            rm -rf build
+
+            export BOOST_ROOT=/opt/boost
+            export CMAKE_PREFIX_PATH=/opt/boost
+
             cmake \
-            dpkg-dev \
-            file \
-            libboost-all-dev \
-            liblzma-dev \
+              -B /src/build \
+              -Werror=dev \
+              -Werror=deprecated \
+              -DCONTINUOUS_INTEGRATION=1 \
+              -DBoost_ROOT=/opt/boost \
+              -DBoost_NO_SYSTEM_PATHS=ON
+
+            echo
+            echo "========================================"
+            echo "Build innoextract"
+            echo "========================================"
+
+            cmake \
+              --build /src/build \
+              --parallel
+
+            echo
+            echo "========================================"
+            echo "Check style"
+            echo "========================================"
+
+            cmake \
+              --build /src/build \
+              --target style
+
+            echo
+            echo "========================================"
+            echo "Binary"
+            echo "========================================"
+
+            file /src/build/innoextract
+
+            echo
+            echo "Dependencies:"
+            ldd /src/build/innoextract
+
+
+            # ====================================================
+            # Prepare Debian package
+            # ====================================================
+
+            echo
+            echo "========================================"
+            echo "Prepare Debian package"
+            echo "========================================"
+
+            PKGROOT="/src/package"
+            LIBDIR="${PKGROOT}/usr/lib/innoextract"
+
+            rm -rf "$PKGROOT"
+
+            mkdir -p \
+              "${PKGROOT}/DEBIAN" \
+              "${PKGROOT}/usr/bin" \
+              "$LIBDIR"
+
+            cp \
+              /src/build/innoextract \
+              "${PKGROOT}/usr/bin/innoextract"
+
+            chmod 0755 \
+              "${PKGROOT}/usr/bin/innoextract"
+
+
+            # ====================================================
+            # Collect recursive runtime dependencies.
+            # ====================================================
+
+            echo
+            echo "========================================"
+            echo "Collect runtime dependencies"
+            echo "========================================"
+
+            lddtree -l /src/build/innoextract \
+              > /tmp/all-libraries.txt
+
+            cat /tmp/all-libraries.txt
+
+
+            echo
+            echo "========================================"
+            echo "Bundle runtime libraries"
+            echo "========================================"
+
+            while read -r LIB; do
+
+              [[ "$LIB" = /* ]] || continue
+
+              BASENAME="$(basename "$LIB")"
+
+              case "$BASENAME" in
+
+                # ------------------------------------------------
+                # Do NOT bundle glibc / dynamic loader.
+                # ------------------------------------------------
+
+                ld-linux*.so*)
+                  echo "System library (dynamic loader): $LIB"
+                  continue
+                  ;;
+
+                libc.so.*)
+                  echo "System library (glibc): $LIB"
+                  continue
+                  ;;
+
+                libm.so.*)
+                  echo "System library (glibc): $LIB"
+                  continue
+                  ;;
+
+                libdl.so.*)
+                  echo "System library (glibc): $LIB"
+                  continue
+                  ;;
+
+                libpthread.so.*)
+                  echo "System library (glibc): $LIB"
+                  continue
+                  ;;
+
+                librt.so.*)
+                  echo "System library (glibc): $LIB"
+                  continue
+                  ;;
+
+              esac
+
+              echo "Bundling: $LIB"
+
+              cp -L \
+                "$LIB" \
+                "$LIBDIR/$BASENAME"
+
+            done < /tmp/all-libraries.txt
+
+
+            echo
+            echo "========================================"
+            echo "Bundled libraries"
+            echo "========================================"
+
+            ls -lah "$LIBDIR"
+
+
+            # ====================================================
+            # Make the executable search the bundled libraries.
+            # ====================================================
+
+            echo
+            echo "========================================"
+            echo "Set RPATH"
+            echo "========================================"
+
             patchelf \
-            pax-utils
+              --set-rpath /usr/lib/innoextract \
+              "${PKGROOT}/usr/bin/innoextract"
 
-      - name: Show toolchain versions
-        run: |
-          cmake --version
-          gcc --version
-          g++ --version
-          dpkg --print-architecture
+            echo "RPATH:"
+            patchelf \
+              --print-rpath \
+              "${PKGROOT}/usr/bin/innoextract"
 
-      - name: Configure
-        run: |
-          cmake \
-            -B "${{ github.workspace }}/build" \
-            -Werror=dev \
-            -Werror=deprecated \
-            -DCONTINUOUS_INTEGRATION=1
 
-      - name: Build
-        run: |
-          cmake \
-            --build "${{ github.workspace }}/build" \
-            --parallel
+            # ====================================================
+            # Debian control file
+            # ====================================================
 
-      - name: Check style
-        run: |
-          cmake \
-            --build "${{ github.workspace }}/build" \
-            --target style
+            echo
+            echo "========================================"
+            echo "Create Debian control file"
+            echo "========================================"
 
-      - name: Show binary dependencies
-        run: |
-          echo "Binary:"
-          file build/innoextract
+            VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
+            ARCH="$(dpkg --print-architecture)"
 
-          echo
-          echo "Dependencies:"
-          ldd build/innoextract
+            cat > "${PKGROOT}/DEBIAN/control" <<EOF
+            Package: innoextract
+            Version: ${VERSION}
+            Section: utils
+            Priority: optional
+            Architecture: ${ARCH}
+            Maintainer: innoextract CI
+            Description: Tool for extracting Inno Setup installers
+             innoextract extracts files from installers created by Inno Setup.
+            EOF
 
-      - name: Prepare Debian package
-        shell: bash
-        run: |
-          set -euo pipefail
 
-          PKGROOT="${PWD}/package"
-          LIBDIR="${PKGROOT}/usr/lib/innoextract"
-          VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
-          ARCH="$(dpkg --print-architecture)"
+            # ====================================================
+            # Build .deb
+            # ====================================================
 
-          rm -rf "$PKGROOT"
-          mkdir -p "${PKGROOT}/DEBIAN" "${PKGROOT}/usr/bin" "$LIBDIR"
+            echo
+            echo "========================================"
+            echo "Build Debian package"
+            echo "========================================"
 
-          cp build/innoextract "${PKGROOT}/usr/bin/innoextract"
-          chmod 0755 "${PKGROOT}/usr/bin/innoextract"
+            dpkg-deb \
+              --build \
+              --root-owner-group \
+              "${PKGROOT}" \
+              "/src/ci-output/innoextract_${VERSION}_${ARCH}.deb"
 
-          echo "========================================"
-          echo "Original binary dependencies"
-          echo "========================================"
-          ldd build/innoextract
 
-          echo
-          echo "========================================"
-          echo "Collecting recursive dependencies"
-          echo "========================================"
-          lddtree -l build/innoextract > /tmp/all-libraries.txt
-          cat /tmp/all-libraries.txt
+            # ====================================================
+            # Inspect package
+            # ====================================================
 
-          echo
-          echo "========================================"
-          echo "Bundling libraries"
-          echo "========================================"
-          while read -r LIB; do
-            [ "${LIB#/}" != "$LIB" ] || continue
-            BASENAME="$(basename "$LIB")"
-            case "$BASENAME" in
-              ld-linux*.so*|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*)
-                echo "System library: $LIB"
-                continue
-                ;;
-            esac
-            echo "Bundling: $LIB"
-            cp -L "$LIB" "$LIBDIR/$BASENAME"
-          done < /tmp/all-libraries.txt
+            echo
+            echo "========================================"
+            echo "Package information"
+            echo "========================================"
 
-          echo
-          echo "========================================"
-          echo "Bundled libraries"
-          echo "========================================"
-          ls -lah "$LIBDIR"
+            dpkg-deb \
+              --info \
+              /src/ci-output/innoextract_*.deb
 
-          echo
-          echo "========================================"
-          echo "Setting RPATH"
-          echo "========================================"
-          patchelf --set-rpath /usr/lib/innoextract "${PKGROOT}/usr/bin/innoextract"
-          patchelf --print-rpath "${PKGROOT}/usr/bin/innoextract"
+            echo
+            echo "========================================"
+            echo "Package contents"
+            echo "========================================"
 
-          printf "%s\n" \
-            "Package: innoextract" \
-            "Version: ${VERSION}" \
-            "Section: utils" \
-            "Priority: optional" \
-            "Architecture: ${ARCH}" \
-            "Maintainer: innoextract CI" \
-            "Description: Tool for extracting Inno Setup installers" \
-            " innoextract extracts files from installers created by Inno Setup." \
-            > "${PKGROOT}/DEBIAN/control"
+            dpkg-deb \
+              --contents \
+              /src/ci-output/innoextract_*.deb
+          '
 
-          dpkg-deb \
-            --build \
-            --root-owner-group \
-            "${PKGROOT}" \
-            "innoextract_${VERSION}_${ARCH}.deb"
 
-      - name: Inspect Debian package
-        run: |
-          echo "========================================"
-          echo "Package information"
-          echo "========================================"
-          dpkg-deb --info innoextract_*.deb
+    # ============================================================
+    # Test the generated package on Debian 10.
+    # ============================================================
 
-          echo
-          echo "========================================"
-          echo "Package contents"
-          echo "========================================"
-          dpkg-deb --contents innoextract_*.deb
+    - name: Test package on Debian 10
+      shell: bash
+      run: |
+        set -euo pipefail
 
-      - name: Upload Debian package
-        uses: actions/upload-artifact@v4
-        with:
-          name: innoextract-debian-amd64
-          path: innoextract_*.deb
-          if-no-files-found: error
+        docker run --rm \
+          -v "${PWD}/ci-output:/work" \
+          debian:10 \
+          bash -euxo pipefail -c '
 
-  test-debian10:
-    name: Test package on Debian 10
-    runs-on: ubuntu-latest
-    needs: build-debian10
-    container:
-      image: debian:10
+            export DEBIAN_FRONTEND=noninteractive
 
-    steps:
-      - name: Configure Debian 10 APT archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf "%s\n" \
-            "deb http://archive.debian.org/debian buster main" \
-            "deb http://archive.debian.org/debian-security buster/updates main" \
-            > /etc/apt/sources.list
-          printf "%s\n" 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+            echo "========================================"
+            echo "Debian 10 test environment"
+            echo "========================================"
 
-      - name: Install test dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
+            cat /etc/os-release
 
-      - name: Download Debian package
-        uses: actions/download-artifact@v4
-        with:
-          name: innoextract-debian-amd64
+            echo
+            echo "========================================"
+            echo "Configure repositories"
+            echo "========================================"
 
-      - name: Install and test package
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEBIAN_FRONTEND=noninteractive apt-get install -y ./innoextract_*.deb
-          command -v innoextract
-          ls -l /usr/bin/innoextract
-          ldd /usr/bin/innoextract
-          if ldd /usr/bin/innoextract | grep -q "not found"; then
-            echo "ERROR: Missing runtime libraries!"
+            cat > /etc/apt/sources.list <<EOF
+            deb http://archive.debian.org/debian buster main
+            deb http://archive.debian.org/debian-security buster/updates main
+            EOF
+
+            cat > /etc/apt/apt.conf.d/99archive <<EOF
+            Acquire::Check-Valid-Until "false";
+            EOF
+
+            apt-get update
+
+            echo
+            echo "========================================"
+            echo "Install minimal test tools"
+            echo "========================================"
+
+            apt-get install -y \
+              ca-certificates \
+              file
+
+            echo
+            echo "========================================"
+            echo "Install innoextract"
+            echo "========================================"
+
+            apt-get install -y \
+              /work/innoextract_*.deb
+
+            echo
+            echo "========================================"
+            echo "Installed binary"
+            echo "========================================"
+
+            command -v innoextract
+            file /usr/bin/innoextract
+
+            echo
+            echo "========================================"
+            echo "Runtime dependencies"
+            echo "========================================"
+
             ldd /usr/bin/innoextract
-            exit 1
-          fi
-          innoextract --debug --help
 
-  test-ubuntu24:
-    name: Test package on Ubuntu 24.04
-    runs-on: ubuntu-latest
-    needs: build-debian10
-    container:
-      image: ubuntu:24.04
+            echo
+            echo "========================================"
+            echo "Check missing libraries"
+            echo "========================================"
 
-    steps:
-      - name: Install test dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
+            if ldd /usr/bin/innoextract | grep -q "not found"; then
+              echo
+              echo "ERROR: Missing runtime libraries!"
+              echo
+              ldd /usr/bin/innoextract
+              exit 1
+            fi
 
-      - name: Download Debian package
-        uses: actions/download-artifact@v4
-        with:
-          name: innoextract-debian-amd64
+            echo "All runtime libraries found."
 
-      - name: Install and test package
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEBIAN_FRONTEND=noninteractive apt-get install -y ./innoextract_*.deb
-          command -v innoextract
-          ls -l /usr/bin/innoextract
-          ldd /usr/bin/innoextract
-          if ldd /usr/bin/innoextract | grep -q "not found"; then
-            echo "ERROR: Missing runtime libraries!"
+            echo
+            echo "========================================"
+            echo "Check bundled Boost"
+            echo "========================================"
+
+            ldd /usr/bin/innoextract | grep \
+              "/usr/lib/innoextract/libboost_"
+
+            echo
+            echo "========================================"
+            echo "Run innoextract"
+            echo "========================================"
+
+            innoextract --help
+
+            echo
+            echo "========================================"
+            echo "Debian 10 test successful"
+            echo "========================================"
+          '
+
+
+    # ============================================================
+    # Test on current Ubuntu as well.
+    #
+    # This verifies that a binary built against old Debian/glibc
+    # still runs on a current Ubuntu.
+    # ============================================================
+
+    - name: Test package on current Ubuntu
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        docker run --rm \
+          -v "${PWD}/ci-output:/work" \
+          ubuntu:latest \
+          bash -euxo pipefail -c '
+
+            export DEBIAN_FRONTEND=noninteractive
+
+            echo "========================================"
+            echo "Current Ubuntu test environment"
+            echo "========================================"
+
+            cat /etc/os-release
+
+            echo
+            echo "========================================"
+            echo "Install minimal test tools"
+            echo "========================================"
+
+            apt-get update
+
+            apt-get install -y \
+              ca-certificates \
+              file
+
+            echo
+            echo "========================================"
+            echo "Install innoextract"
+            echo "========================================"
+
+            apt-get install -y \
+              /work/innoextract_*.deb
+
+            echo
+            echo "========================================"
+            echo "Runtime dependencies"
+            echo "========================================"
+
             ldd /usr/bin/innoextract
-            exit 1
-          fi
-          innoextract --debug --help
+
+            echo
+            echo "========================================"
+            echo "Check missing libraries"
+            echo "========================================"
+
+            if ldd /usr/bin/innoextract | grep -q "not found"; then
+              echo
+              echo "ERROR: Missing runtime libraries!"
+              echo
+              ldd /usr/bin/innoextract
+              exit 1
+            fi
+
+            echo "All runtime libraries found."
+
+            echo
+            echo "========================================"
+            echo "Check bundled Boost"
+            echo "========================================"
+
+            ldd /usr/bin/innoextract | grep \
+              "/usr/lib/innoextract/libboost_"
+
+            echo
+            echo "========================================"
+            echo "Run innoextract"
+            echo "========================================"
+
+            innoextract --help
+
+            echo
+            echo "========================================"
+            echo "Current Ubuntu test successful"
+            echo "========================================"
+          '
+
+
+    # ============================================================
+    # Upload final .deb as GitHub Actions artifact.
+    # ============================================================
+
+    - name: Upload Debian package
+      uses: actions/upload-artifact@v4
+      with:
+        name: innoextract-debian-amd64
+        path: ci-output/*.deb
+        if-no-files-found: error
