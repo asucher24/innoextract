@@ -28,6 +28,7 @@ jobs:
       - name: Prepare output directory
         run: |
           set -euo pipefail
+          rm -rf ci-output
           mkdir -p ci-output
 
       - name: Build Debian 10 package
@@ -225,74 +226,57 @@ jobs:
 
               echo
               echo '========================================'
-              echo 'Collect runtime libraries'
+              echo 'Collect required libraries'
               echo '========================================'
 
-              lddtree -l /src/build/innoextract \
-                > /tmp/all-libraries.txt
-
-              cat /tmp/all-libraries.txt
+              ldd /src/build/innoextract
 
               echo
               echo '========================================'
-              echo 'Bundle runtime libraries'
+              echo 'Copy Boost libraries'
               echo '========================================'
 
-              while read -r LIB; do
-
-                if [ -z \"\${LIB}\" ]; then
-                  continue
-                fi
-
-                case \"\${LIB}\" in
-                  /*)
-                    ;;
-                  *)
-                    continue
-                    ;;
-                esac
-
-                BASENAME=\$(basename \"\${LIB}\")
-
-                case \"\${BASENAME}\" in
-                  ld-linux*.so*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                  libc.so.*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                  libm.so.*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                  libdl.so.*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                  libpthread.so.*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                  librt.so.*)
-                    echo \"System library: \${LIB}\"
-                    continue
-                    ;;
-                esac
-
-                echo \"Bundling: \${LIB}\"
-
-                cp -L \
-                  \"\${LIB}\" \
-                  \"\${LIBDIR}/\${BASENAME}\"
-
-              done < /tmp/all-libraries.txt
+              find /opt/boost/lib \
+                -maxdepth 1 \
+                -type f \
+                -name 'libboost_*.so*' \
+                -exec cp -L {} \"\${LIBDIR}/\" \;
 
               echo
               echo '========================================'
-              echo 'Bundled libraries'
+              echo 'Copy liblzma'
               echo '========================================'
+
+              LZMA_PATH=\$(ldconfig -p | awk '/liblzma.so.5/{print \$NF; exit}')
+
+              if [ -z \"\${LZMA_PATH}\" ]; then
+                echo 'ERROR: Could not find liblzma.so.5'
+                exit 1
+              fi
+
+              echo \"liblzma: \${LZMA_PATH}\"
+
+              cp -L \
+                \"\${LZMA_PATH}\" \
+                \"\${LIBDIR}/\"
+
+              echo
+              echo '========================================'
+              echo 'Remove unwanted libraries'
+              echo '========================================'
+
+              rm -f \
+                \"\${LIBDIR}/libstdc++.so.6\" \
+                \"\${LIBDIR}/libgcc_s.so.1\" \
+                \"\${LIBDIR}/libc.so.6\" \
+                \"\${LIBDIR}/libm.so.6\" \
+                \"\${LIBDIR}/libdl.so.2\" \
+                \"\${LIBDIR}/libpthread.so.0\" \
+                \"\${LIBDIR}/librt.so.1\" \
+                \"\${LIBDIR}/ld-linux-x86-64.so.2\"
+
+              echo
+              echo 'Libraries inside package:'
 
               ls -lah \"\${LIBDIR}\"
 
@@ -305,12 +289,17 @@ jobs:
                 --set-rpath /usr/lib/innoextract \
                 \"\${PKGROOT}/usr/bin/innoextract\"
 
-              echo
-              echo 'RPATH:'
-
               patchelf \
                 --print-rpath \
                 \"\${PKGROOT}/usr/bin/innoextract\"
+
+              echo
+              echo '========================================'
+              echo 'Verify package binary'
+              echo '========================================'
+
+              LD_LIBRARY_PATH=\"\${LIBDIR}\" \
+                ldd \"\${PKGROOT}/usr/bin/innoextract\"
 
               echo
               echo '========================================'
@@ -366,7 +355,7 @@ jobs:
               echo '========================================'
             "
 
-      - name: Test package on Debian 10
+      - name: Test package on clean Debian 10
         run: |
           set -euo pipefail
 
@@ -394,6 +383,11 @@ jobs:
                 > /etc/apt/apt.conf.d/99archive
 
               apt-get update
+
+              echo
+              echo '========================================'
+              echo 'Install minimal test dependencies'
+              echo '========================================'
 
               apt-get install -y \
                 ca-certificates \
@@ -438,16 +432,44 @@ jobs:
 
               echo
               echo '========================================'
-              echo 'Check bundled Boost'
+              echo 'Verify bundled Boost'
               echo '========================================'
 
-              if ! ldd /usr/bin/innoextract | grep -q '/usr/lib/innoextract/libboost_'; then
-                echo 'ERROR: Boost is not loaded from the package.'
-                ldd /usr/bin/innoextract
+              for LIB in \
+                libboost_iostreams.so.1.83.0 \
+                libboost_filesystem.so.1.83.0 \
+                libboost_program_options.so.1.83.0; do
+
+                if [ ! -f \"/usr/lib/innoextract/\${LIB}\" ]; then
+                  echo \"ERROR: Missing bundled Boost library: \${LIB}\"
+                  exit 1
+                fi
+
+                echo \"Found: \${LIB}\"
+              done
+
+              echo
+              echo '========================================'
+              echo 'Verify system libstdc++'
+              echo '========================================'
+
+              SYSTEM_STDCXX=\$(ldd /usr/bin/innoextract | awk '/libstdc\\+\\+\\.so\\.6/{print \$3; exit}')
+
+              if [ -z \"\${SYSTEM_STDCXX}\" ]; then
+                echo 'ERROR: libstdc++.so.6 was not resolved.'
                 exit 1
               fi
 
-              echo 'Bundled Boost libraries are being used.'
+              echo \"System libstdc++: \${SYSTEM_STDCXX}\"
+
+              case \"\${SYSTEM_STDCXX}\" in
+                /usr/lib/innoextract/*)
+                  echo 'ERROR: libstdc++ must NOT be bundled.'
+                  exit 1
+                  ;;
+              esac
+
+              echo 'System libstdc++ is correctly used.'
 
               echo
               echo '========================================'
@@ -516,16 +538,21 @@ jobs:
 
               echo
               echo '========================================'
-              echo 'Check bundled Boost'
+              echo 'Verify bundled Boost'
               echo '========================================'
 
-              if ! ldd /usr/bin/innoextract | grep -q '/usr/lib/innoextract/libboost_'; then
-                echo 'ERROR: Boost is not loaded from the package.'
-                ldd /usr/bin/innoextract
-                exit 1
-              fi
+              for LIB in \
+                libboost_iostreams.so.1.83.0 \
+                libboost_filesystem.so.1.83.0 \
+                libboost_program_options.so.1.83.0; do
 
-              echo 'Bundled Boost libraries are being used.'
+                if [ ! -f \"/usr/lib/innoextract/\${LIB}\" ]; then
+                  echo \"ERROR: Missing bundled Boost library: \${LIB}\"
+                  exit 1
+                fi
+
+                echo \"Found: \${LIB}\"
+              done
 
               echo
               echo '========================================'
