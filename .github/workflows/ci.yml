@@ -28,8 +28,16 @@ jobs:
       - name: Prepare output directory
         run: |
           set -euo pipefail
-          rm -rf ci-output
-          mkdir -p ci-output
+
+          rm -rf "${GITHUB_WORKSPACE}/ci-output"
+          mkdir -p "${GITHUB_WORKSPACE}/ci-output"
+
+          echo "GitHub workspace:"
+          echo "${GITHUB_WORKSPACE}"
+
+          echo
+          echo "Output directory:"
+          ls -la "${GITHUB_WORKSPACE}/ci-output"
 
       - name: Build Debian 10 debug package
         env:
@@ -43,7 +51,8 @@ jobs:
             -e DEBUG="${DEBUG}" \
             -e DEBUG_EXTRA="${DEBUG_EXTRA}" \
             -e GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER}" \
-            -v "${PWD}:/src" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -v "${GITHUB_WORKSPACE}/ci-output:/out" \
             -w /src \
             debian:10 \
             bash -euxo pipefail <<'DOCKER_SCRIPT'
@@ -176,16 +185,6 @@ jobs:
 
           echo
           echo "========================================"
-          echo "CMake configuration"
-          echo "========================================"
-
-          grep -E \
-            "CMAKE_BUILD_TYPE|Boost_ROOT|Boost_NO_SYSTEM_PATHS" \
-            /src/build/CMakeCache.txt \
-            || true
-
-          echo
-          echo "========================================"
           echo "Build"
           echo "========================================"
 
@@ -278,7 +277,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Never bundle system runtime"
+          echo "Do not bundle system runtimes"
           echo "========================================"
 
           rm -f \
@@ -292,7 +291,7 @@ jobs:
             "${LIBDIR}/ld-linux-x86-64.so.2"
 
           echo
-          echo "Libraries that will be bundled:"
+          echo "Libraries bundled into package:"
           find "${LIBDIR}" \
             -maxdepth 1 \
             -type f \
@@ -321,6 +320,14 @@ jobs:
           LD_LIBRARY_PATH="${LIBDIR}" \
             ldd "${PKGROOT}/usr/bin/innoextract"
 
+          if LD_LIBRARY_PATH="${LIBDIR}" \
+            ldd "${PKGROOT}/usr/bin/innoextract" \
+            | grep -q "not found"; then
+
+            echo "ERROR: Missing library before package creation."
+            exit 1
+          fi
+
           echo
           echo "========================================"
           echo "Create Debian package metadata"
@@ -345,11 +352,30 @@ jobs:
           echo "Build Debian package"
           echo "========================================"
 
+          OUTPUT="/out/innoextract_${VERSION}_${ARCH}.deb"
+
+          rm -f /out/*.deb
+
           dpkg-deb \
             --build \
             --root-owner-group \
             "${PKGROOT}" \
-            "/src/ci-output/innoextract_${VERSION}_${ARCH}.deb"
+            "${OUTPUT}"
+
+          echo
+          echo "========================================"
+          echo "Verify output"
+          echo "========================================"
+
+          if [ ! -f "${OUTPUT}" ]; then
+            echo "ERROR: Debian package was not created:"
+            echo "${OUTPUT}"
+            exit 1
+          fi
+
+          ls -lh "${OUTPUT}"
+
+          file "${OUTPUT}"
 
           echo
           echo "========================================"
@@ -358,7 +384,7 @@ jobs:
 
           dpkg-deb \
             --info \
-            /src/ci-output/innoextract_*.deb
+            "${OUTPUT}"
 
           echo
           echo "========================================"
@@ -367,34 +393,72 @@ jobs:
 
           dpkg-deb \
             --contents \
-            /src/ci-output/innoextract_*.deb
+            "${OUTPUT}"
 
           echo
           echo "========================================"
-          echo "Verify no system runtimes are bundled"
+          echo "Final output directory"
           echo "========================================"
 
-          if dpkg-deb --contents /src/ci-output/innoextract_*.deb \
-            | grep -E \
-              '/(libstdc\+\+|libgcc_s|libc|libm|libdl|libpthread|librt|ld-linux)' \
-              ; then
+          ls -lah /out
 
-            echo "ERROR: System runtime library found in package."
+          echo
+          echo "========================================"
+          echo "Package created successfully"
+          echo "========================================"
+
+          DOCKER_SCRIPT
+
+      - name: Verify artifact exists
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "CI output"
+          echo "========================================"
+
+          ls -lah "${GITHUB_WORKSPACE}/ci-output"
+
+          echo
+          echo "Debian packages:"
+          find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -print
+
+          DEB_COUNT="$(find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            | wc -l)"
+
+          if [ "${DEB_COUNT}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one .deb package, found ${DEB_COUNT}."
             exit 1
           fi
 
           echo
-          echo "Package created successfully."
-
-          DOCKER_SCRIPT
+          echo "Package ready for upload:"
+          find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -exec ls -lh {} \;
 
       - name: Test package on clean Debian 10
         run: |
           set -euo pipefail
 
+          PACKAGE="$(find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -print -quit)"
+
           docker run --rm \
             --user root \
-            -v "${PWD}/ci-output:/work:ro" \
+            -v "${PACKAGE}:/work/package.deb:ro" \
             debian:10 \
             bash -euxo pipefail <<'DOCKER_TEST'
 
@@ -427,17 +491,19 @@ jobs:
           echo "Install package"
           echo "========================================"
 
-          dpkg -i /work/innoextract_*.deb
+          dpkg -i /work/package.deb
 
           echo
           echo "========================================"
-          echo "Verify package installation"
+          echo "Verify installation"
           echo "========================================"
 
           dpkg-query \
             -W \
             -f='${Status}\n' \
             innoextract
+
+          test -x /usr/bin/innoextract
 
           echo
           echo "========================================"
@@ -446,16 +512,12 @@ jobs:
 
           ldd /usr/bin/innoextract
 
-          echo
-          echo "========================================"
-          echo "Check for missing libraries"
-          echo "========================================"
-
           if ldd /usr/bin/innoextract | grep -q "not found"; then
             echo "ERROR: Missing runtime library."
             exit 1
           fi
 
+          echo
           echo "All runtime libraries found."
 
           echo
@@ -506,9 +568,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          PACKAGE="$(find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -print -quit)"
+
           docker run --rm \
             --user root \
-            -v "${PWD}/ci-output:/work:ro" \
+            -v "${PACKAGE}:/work/package.deb:ro" \
             ubuntu:latest \
             bash -euxo pipefail <<'DOCKER_TEST'
 
@@ -532,7 +600,7 @@ jobs:
           echo "Install package"
           echo "========================================"
 
-          dpkg -i /work/innoextract_*.deb
+          dpkg -i /work/package.deb
 
           echo
           echo "========================================"
@@ -546,6 +614,7 @@ jobs:
             exit 1
           fi
 
+          echo
           echo "All runtime libraries found."
 
           echo
@@ -566,5 +635,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: innoextract-debian10-amd64-debug
-          path: ci-output/*.deb
+          path: ${{ github.workspace }}/ci-output/*.deb
           if-no-files-found: error
+          compression-level: 0
