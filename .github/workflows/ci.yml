@@ -25,19 +25,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare output directory
+      - name: Prepare output directories
         run: |
           set -euo pipefail
 
           rm -rf "${GITHUB_WORKSPACE}/ci-output"
-          mkdir -p "${GITHUB_WORKSPACE}/ci-output"
+          rm -rf "${RUNNER_TEMP}/innoextract-output"
 
-          echo "GitHub workspace:"
-          echo "${GITHUB_WORKSPACE}"
+          mkdir -p "${GITHUB_WORKSPACE}/ci-output"
+          mkdir -p "${RUNNER_TEMP}/innoextract-output"
+
+          echo "========================================"
+          echo "Workspace"
+          echo "========================================"
+
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "RUNNER_TEMP=${RUNNER_TEMP}"
 
           echo
-          echo "Output directory:"
+          echo "Workspace:"
+          ls -la "${GITHUB_WORKSPACE}"
+
+          echo
+          echo "Output:"
           ls -la "${GITHUB_WORKSPACE}/ci-output"
+
+          echo
+          echo "Temporary Docker output:"
+          ls -la "${RUNNER_TEMP}/innoextract-output"
 
       - name: Build Debian 10 debug package
         env:
@@ -46,13 +61,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "========================================"
+          echo "Starting Debian 10 build container"
+          echo "========================================"
+
           docker run --rm \
             --user root \
             -e DEBUG="${DEBUG}" \
             -e DEBUG_EXTRA="${DEBUG_EXTRA}" \
             -e GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER}" \
             -v "${GITHUB_WORKSPACE}:/src" \
-            -v "${GITHUB_WORKSPACE}/ci-output:/out" \
+            -v "${RUNNER_TEMP}/innoextract-output:/out" \
             -w /src \
             debian:10 \
             bash -euxo pipefail <<'DOCKER_SCRIPT'
@@ -99,7 +118,6 @@ jobs:
             dpkg-dev \
             file \
             patchelf \
-            pax-utils \
             pkg-config \
             liblzma-dev \
             zlib1g-dev \
@@ -121,6 +139,16 @@ jobs:
 
           echo "DEBUG=${DEBUG}"
           echo "DEBUG_EXTRA=${DEBUG_EXTRA}"
+
+          if [ "${DEBUG}" != "on" ]; then
+            echo "ERROR: DEBUG is not 'on'."
+            exit 1
+          fi
+
+          if [ "${DEBUG_EXTRA}" != "on" ]; then
+            echo "ERROR: DEBUG_EXTRA is not 'on'."
+            exit 1
+          fi
 
           echo
           echo "========================================"
@@ -151,10 +179,7 @@ jobs:
             install
 
           echo
-          echo "========================================"
-          echo "Boost libraries"
-          echo "========================================"
-
+          echo "Boost libraries:"
           find /opt/boost/lib \
             -maxdepth 1 \
             -type f \
@@ -221,7 +246,7 @@ jobs:
           file /src/build/innoextract
 
           echo
-          echo "Runtime dependencies before packaging:"
+          echo "Runtime dependencies:"
           ldd /src/build/innoextract
 
           echo
@@ -229,7 +254,7 @@ jobs:
           echo "Prepare Debian package"
           echo "========================================"
 
-          PKGROOT="/src/package"
+          PKGROOT="/tmp/innoextract-package"
           LIBDIR="${PKGROOT}/usr/lib/innoextract"
 
           rm -rf "${PKGROOT}"
@@ -248,7 +273,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Copy Boost runtime libraries"
+          echo "Bundle Boost runtime libraries"
           echo "========================================"
 
           find /opt/boost/lib \
@@ -258,18 +283,27 @@ jobs:
             -exec cp -L {} "${LIBDIR}/" \;
 
           echo
+          echo "Bundled Boost libraries:"
+          find "${LIBDIR}" \
+            -maxdepth 1 \
+            -type f \
+            -name "libboost_*.so*" \
+            -printf "%f\n" \
+            | sort
+
+          echo
           echo "========================================"
-          echo "Copy liblzma"
+          echo "Bundle liblzma"
           echo "========================================"
 
           LZMA_PATH="$(ldconfig -p | awk '/liblzma.so.5/{print $NF; exit}')"
 
           if [ -z "${LZMA_PATH}" ]; then
-            echo "ERROR: liblzma.so.5 not found"
+            echo "ERROR: liblzma.so.5 could not be located."
             exit 1
           fi
 
-          echo "Using ${LZMA_PATH}"
+          echo "liblzma: ${LZMA_PATH}"
 
           cp -L \
             "${LZMA_PATH}" \
@@ -277,7 +311,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Do not bundle system runtimes"
+          echo "Do not bundle system libraries"
           echo "========================================"
 
           rm -f \
@@ -291,7 +325,7 @@ jobs:
             "${LIBDIR}/ld-linux-x86-64.so.2"
 
           echo
-          echo "Libraries bundled into package:"
+          echo "All bundled libraries:"
           find "${LIBDIR}" \
             -maxdepth 1 \
             -type f \
@@ -300,7 +334,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Set RPATH"
+          echo "Configure RPATH"
           echo "========================================"
 
           patchelf \
@@ -324,9 +358,12 @@ jobs:
             ldd "${PKGROOT}/usr/bin/innoextract" \
             | grep -q "not found"; then
 
-            echo "ERROR: Missing library before package creation."
+            echo "ERROR: Missing runtime library."
             exit 1
           fi
+
+          echo
+          echo "All runtime libraries are available."
 
           echo
           echo "========================================"
@@ -364,87 +401,84 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Verify output"
+          echo "Verify package inside Docker"
           echo "========================================"
 
-          if [ ! -f "${OUTPUT}" ]; then
-            echo "ERROR: Debian package was not created:"
-            echo "${OUTPUT}"
-            exit 1
-          fi
+          test -f "${OUTPUT}"
 
           ls -lh "${OUTPUT}"
 
           file "${OUTPUT}"
 
           echo
-          echo "========================================"
-          echo "Package information"
-          echo "========================================"
+          echo "Package:"
+          dpkg-deb --info "${OUTPUT}"
 
-          dpkg-deb \
-            --info \
-            "${OUTPUT}"
+          echo
+          echo "Contents:"
+          dpkg-deb --contents "${OUTPUT}"
 
           echo
           echo "========================================"
-          echo "Package contents"
-          echo "========================================"
-
-          dpkg-deb \
-            --contents \
-            "${OUTPUT}"
-
-          echo
-          echo "========================================"
-          echo "Final output directory"
+          echo "Docker output directory"
           echo "========================================"
 
           ls -lah /out
 
           echo
-          echo "========================================"
-          echo "Package created successfully"
-          echo "========================================"
+          echo "Package successfully created:"
+          echo "${OUTPUT}"
 
           DOCKER_SCRIPT
 
-      - name: Verify artifact exists
+      - name: Collect Debian package
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "CI output"
+          echo "Collect package from Docker"
           echo "========================================"
 
-          ls -lah "${GITHUB_WORKSPACE}/ci-output"
+          echo "Docker output directory:"
+          ls -lah "${RUNNER_TEMP}/innoextract-output"
 
           echo
-          echo "Debian packages:"
-          find "${GITHUB_WORKSPACE}/ci-output" \
+          echo "Files:"
+          find "${RUNNER_TEMP}/innoextract-output" \
             -maxdepth 1 \
             -type f \
-            -name '*.deb' \
             -print
 
-          DEB_COUNT="$(find "${GITHUB_WORKSPACE}/ci-output" \
+          DEB_COUNT="$(find "${RUNNER_TEMP}/innoextract-output" \
             -maxdepth 1 \
             -type f \
             -name '*.deb' \
             | wc -l)"
 
           if [ "${DEB_COUNT}" -ne 1 ]; then
-            echo "ERROR: Expected exactly one .deb package, found ${DEB_COUNT}."
+            echo
+            echo "ERROR: Expected exactly one Debian package."
+            echo "Found: ${DEB_COUNT}"
             exit 1
           fi
 
-          echo
-          echo "Package ready for upload:"
-          find "${GITHUB_WORKSPACE}/ci-output" \
+          DEB_FILE="$(find "${RUNNER_TEMP}/innoextract-output" \
             -maxdepth 1 \
             -type f \
             -name '*.deb' \
-            -exec ls -lh {} \;
+            -print -quit)"
+
+          echo
+          echo "Found:"
+          echo "${DEB_FILE}"
+
+          cp \
+            "${DEB_FILE}" \
+            "${GITHUB_WORKSPACE}/ci-output/"
+
+          echo
+          echo "GitHub output directory:"
+          ls -lah "${GITHUB_WORKSPACE}/ci-output"
 
       - name: Test package on clean Debian 10
         run: |
@@ -455,6 +489,9 @@ jobs:
             -type f \
             -name '*.deb' \
             -print -quit)"
+
+          echo "Testing:"
+          echo "${PACKAGE}"
 
           docker run --rm \
             --user root \
@@ -533,7 +570,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Verify system C++ runtime is used"
+          echo "Verify system C++ runtime"
           echo "========================================"
 
           if find /usr/lib/innoextract \
@@ -573,6 +610,9 @@ jobs:
             -type f \
             -name '*.deb' \
             -print -quit)"
+
+          echo "Testing:"
+          echo "${PACKAGE}"
 
           docker run --rm \
             --user root \
@@ -630,6 +670,46 @@ jobs:
           echo "========================================"
 
           DOCKER_TEST
+
+      - name: Verify final artifact
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Final artifact"
+          echo "========================================"
+
+          ls -lah "${GITHUB_WORKSPACE}/ci-output"
+
+          DEB_COUNT="$(find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            | wc -l)"
+
+          if [ "${DEB_COUNT}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one .deb."
+            echo "Found: ${DEB_COUNT}"
+            exit 1
+          fi
+
+          DEB_FILE="$(find "${GITHUB_WORKSPACE}/ci-output" \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -print -quit)"
+
+          echo
+          echo "Artifact ready:"
+          echo "${DEB_FILE}"
+
+          echo
+          echo "Size:"
+          du -h "${DEB_FILE}"
+
+          echo
+          echo "Type:"
+          file "${DEB_FILE}"
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
