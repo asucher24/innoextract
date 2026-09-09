@@ -11,6 +11,7 @@ on:
 env:
   DEBUG: on
   DEBUG_EXTRA: on
+  CMAKE_BUILD_TYPE: Debug
 
 jobs:
 
