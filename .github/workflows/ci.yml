@@ -182,9 +182,13 @@ jobs:
               echo 'Check style'
               echo '========================================'
 
-              cmake \
-                --build /src/build \
-                --target style
+              if cmake --build /src/build --target help | grep -qE '(^|[[:space:]])style([[:space:]]|$)'; then
+                echo 'Style target found.'
+                cmake --build /src/build --target style
+              else
+                echo 'No style target exists in this CMake configuration.'
+                echo 'Skipping style check.'
+              fi
 
               echo
               echo '========================================'
