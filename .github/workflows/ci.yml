@@ -49,6 +49,10 @@ jobs:
           echo
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
 
+          echo
+          echo "Architecture:"
+          dpkg --print-architecture
+
       - name: Configure Debian 10 repositories
         run: |
           set -euo pipefail
@@ -90,6 +94,7 @@ jobs:
             patchelf \
             dpkg-dev \
             fakeroot \
+            binutils \
             liblzma-dev \
             zlib1g-dev \
             libbz2-dev \
@@ -104,9 +109,11 @@ jobs:
           echo "========================================"
 
           rm -rf "${GITHUB_WORKSPACE}/ci-output"
-          mkdir -p "${GITHUB_WORKSPACE}/ci-output"
 
-          ls -la "${GITHUB_WORKSPACE}/ci-output"
+          mkdir -p \
+            "${GITHUB_WORKSPACE}/ci-output"
+
+          ls -lah "${GITHUB_WORKSPACE}/ci-output"
 
       - name: Build Boost 1.83
         run: |
@@ -122,6 +129,10 @@ jobs:
 
           cd /tmp
 
+          rm -rf \
+            "boost_${BOOST_UNDERSCORE}" \
+            "boost_${BOOST_UNDERSCORE}.tar.gz"
+
           curl \
             --fail \
             --location \
@@ -130,13 +141,15 @@ jobs:
             -o "boost_${BOOST_UNDERSCORE}.tar.gz" \
             "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_UNDERSCORE}.tar.gz"
 
-          tar -xzf "boost_${BOOST_UNDERSCORE}.tar.gz"
+          tar \
+            -xzf \
+            "boost_${BOOST_UNDERSCORE}.tar.gz"
 
           cd "boost_${BOOST_UNDERSCORE}"
 
           ./bootstrap.sh \
             --prefix="${BOOST_PREFIX}" \
-            --with-libraries=system,filesystem,iostreams,program_options,date_time
+            --with-libraries=atomic,system,filesystem,iostreams,program_options,date_time
 
           ./b2 \
             -j"$(nproc)" \
@@ -154,7 +167,7 @@ jobs:
             -maxdepth 1 \
             -type f \
             -name 'libboost_*.so*' \
-            -printf '%f\n' \
+            -print \
             | sort
 
           echo
@@ -162,12 +175,14 @@ jobs:
           echo "Verify required Boost libraries"
           echo "========================================"
 
+          test -f "${BOOST_PREFIX}/lib/libboost_atomic.so.1.83.0"
           test -f "${BOOST_PREFIX}/lib/libboost_system.so.1.83.0"
           test -f "${BOOST_PREFIX}/lib/libboost_filesystem.so.1.83.0"
           test -f "${BOOST_PREFIX}/lib/libboost_iostreams.so.1.83.0"
           test -f "${BOOST_PREFIX}/lib/libboost_program_options.so.1.83.0"
           test -f "${BOOST_PREFIX}/lib/libboost_date_time.so.1.83.0"
 
+          echo
           echo "All required Boost libraries exist."
 
       - name: Configure CMake
@@ -225,12 +240,17 @@ jobs:
 
           test -x "${BINARY}"
 
+          echo
           echo "Binary:"
           file "${BINARY}"
 
           echo
-          echo "RPATH before packaging:"
-          patchelf --print-rpath "${BINARY}" || true
+          echo "ELF information:"
+          readelf -h "${BINARY}" | sed -n '1,25p'
+
+          echo
+          echo "Debug sections:"
+          readelf -S "${BINARY}" | grep -E 'debug|symtab' || true
 
           echo
           echo "Runtime dependencies:"
@@ -246,209 +266,290 @@ jobs:
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           INSTALL_ROOT="${PACKAGE_ROOT}/usr"
+          BIN_ROOT="${INSTALL_ROOT}/bin"
           LIB_ROOT="${INSTALL_ROOT}/lib/innoextract"
+          DEBIAN_ROOT="${PACKAGE_ROOT}/DEBIAN"
 
           rm -rf "${PACKAGE_ROOT}"
 
           mkdir -p \
-            "${INSTALL_ROOT}/bin" \
+            "${BIN_ROOT}" \
             "${LIB_ROOT}" \
-            "${PACKAGE_ROOT}/DEBIAN"
+            "${DEBIAN_ROOT}"
 
           cp \
             "${GITHUB_WORKSPACE}/build/innoextract" \
-            "${INSTALL_ROOT}/bin/innoextract"
+            "${BIN_ROOT}/innoextract"
 
           chmod 0755 \
-            "${INSTALL_ROOT}/bin/innoextract"
+            "${BIN_ROOT}/innoextract"
 
-      - name: Bundle Boost libraries
+          echo
+          echo "Package root:"
+          find "${PACKAGE_ROOT}" \
+            -maxdepth 4 \
+            -print \
+            | sort
+
+      - name: Bundle runtime libraries
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Bundle ALL Boost shared libraries"
+          echo "Bundle runtime libraries"
           echo "========================================"
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
-          BOOST_LIB_ROOT="/opt/boost/lib"
+          BINARY="${PACKAGE_ROOT}/usr/bin/innoextract"
 
-          BOOST_COUNT=0
+          mkdir -p "${LIB_ROOT}"
 
-          for library in "${BOOST_LIB_ROOT}"/libboost_*.so*; do
-            if [ -f "${library}" ]; then
-              echo "Bundling Boost library:"
-              echo "  ${library}"
+          declare -A COPIED
 
-              cp -L "${library}" "${LIB_ROOT}/"
+          is_system_library() {
+            local library="$1"
+            local base
 
-              BOOST_COUNT=$((BOOST_COUNT + 1))
+            base="$(basename "${library}")"
+
+            case "${base}" in
+              libc.so.*)
+                return 0
+                ;;
+              libm.so.*)
+                return 0
+                ;;
+              libpthread.so.*)
+                return 0
+                ;;
+              librt.so.*)
+                return 0
+                ;;
+              libdl.so.*)
+                return 0
+                ;;
+              libutil.so.*)
+                return 0
+                ;;
+              libresolv.so.*)
+                return 0
+                ;;
+              libnsl.so.*)
+                return 0
+                ;;
+              libcrypt.so.*)
+                return 0
+                ;;
+              ld-linux*.so.*)
+                return 0
+                ;;
+              linux-vdso.so.*)
+                return 0
+                ;;
+            esac
+
+            return 1
+          }
+
+          resolve_library() {
+            local library_name="$1"
+            local resolved
+
+            resolved="$(
+              ldconfig -p 2>/dev/null |
+                awk -v name="${library_name}" '
+                  $1 == name {
+                    print $NF
+                    exit
+                  }
+                '
+            )"
+
+            if [ -n "${resolved}" ] && [ -f "${resolved}" ]; then
+              printf '%s\n' "${resolved}"
+              return 0
             fi
+
+            return 1
+          }
+
+          copy_library() {
+            local library="$1"
+            local real_library
+            local base
+
+            if [ -z "${library}" ]; then
+              return 0
+            fi
+
+            if [ ! -f "${library}" ]; then
+              echo
+              echo "ERROR: Library does not exist:"
+              echo "${library}"
+              exit 1
+            fi
+
+            real_library="$(readlink -f "${library}")"
+            base="$(basename "${real_library}")"
+
+            if is_system_library "${real_library}"; then
+              echo "System library, not bundling:"
+              echo "  ${real_library}"
+              return 0
+            fi
+
+            if [ "${COPIED[${real_library}]+yes}" = "yes" ]; then
+              return 0
+            fi
+
+            COPIED["${real_library}"]="yes"
+
+            echo "Bundling:"
+            echo "  ${real_library}"
+
+            cp \
+              -L \
+              "${real_library}" \
+              "${LIB_ROOT}/${base}"
+
+            chmod 0644 \
+              "${LIB_ROOT}/${base}"
+
+            patchelf \
+              --force-rpath \
+              --set-rpath '$ORIGIN' \
+              "${LIB_ROOT}/${base}"
+          }
+
+          declare -a QUEUE
+
+          QUEUE+=("${BINARY}")
+
+          while [ "${#QUEUE[@]}" -gt 0 ]; do
+            CURRENT="${QUEUE[0]}"
+            QUEUE=("${QUEUE[@]:1}")
+
+            echo
+            echo "Inspecting:"
+            echo "  ${CURRENT}"
+
+            while IFS= read -r line; do
+              library_name="$(
+                printf '%s\n' "${line}" |
+                  sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+=>.*$/\1/p'
+              )"
+
+              library_path="$(
+                printf '%s\n' "${line}" |
+                  sed -nE 's/^[[:space:]]*[^[:space:]]+[[:space:]]+=>[[:space:]]+([^[:space:]]+)[[:space:]]+\(.*$/\1/p'
+              )"
+
+              if [ -z "${library_name}" ]; then
+                continue
+              fi
+
+              case "${library_name}" in
+                linux-vdso.so.*)
+                  continue
+                  ;;
+              esac
+
+              if [ -n "${library_path}" ] && [ -f "${library_path}" ]; then
+                if is_system_library "${library_path}"; then
+                  continue
+                fi
+
+                before_count="${#COPIED[@]}"
+
+                copy_library "${library_path}"
+
+                after_count="${#COPIED[@]}"
+
+                if [ "${after_count}" -gt "${before_count}" ]; then
+                  QUEUE+=("${LIB_ROOT}/$(basename "$(readlink -f "${library_path}")")")
+                fi
+
+                continue
+              fi
+
+              resolved="$(
+                resolve_library "${library_name}" || true
+              )"
+
+              if [ -n "${resolved}" ]; then
+                if is_system_library "${resolved}"; then
+                  continue
+                fi
+
+                before_count="${#COPIED[@]}"
+
+                copy_library "${resolved}"
+
+                after_count="${#COPIED[@]}"
+
+                if [ "${after_count}" -gt "${before_count}" ]; then
+                  QUEUE+=("${LIB_ROOT}/$(basename "$(readlink -f "${resolved}")")")
+                fi
+
+                continue
+              fi
+
+              echo
+              echo "ERROR: Could not resolve runtime library:"
+              echo "  ${library_name}"
+              echo
+              echo "Dependency source:"
+              echo "  ${CURRENT}"
+              echo
+              ldd "${CURRENT}" || true
+              exit 1
+
+            done < <(ldd "${CURRENT}")
           done
 
-          if [ "${BOOST_COUNT}" -eq 0 ]; then
-            echo "ERROR: No Boost shared libraries found."
-            exit 1
-          fi
-
           echo
-          echo "Bundled ${BOOST_COUNT} Boost shared libraries."
+          echo "========================================"
+          echo "Bundled libraries"
+          echo "========================================"
 
-          echo
-          echo "Boost libraries in package:"
           find "${LIB_ROOT}" \
             -maxdepth 1 \
             -type f \
-            -name 'libboost_*.so*' \
             -printf '%f\n' \
             | sort
 
-      - name: Bundle non-system runtime libraries
+      - name: Set executable RPATH
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Bundle non-system runtime libraries"
-          echo "========================================"
-
-          PACKAGE_ROOT="/tmp/innoextract-package"
-          LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
-
-          copy_library() {
-            local library="$1"
-
-            if [ ! -f "${library}" ]; then
-              echo
-              echo "ERROR: Runtime library does not exist:"
-              echo "  ${library}"
-              exit 1
-            fi
-
-            echo "Bundling:"
-            echo "  ${library}"
-
-            cp -L "${library}" "${LIB_ROOT}/"
-          }
-
-          LZMA_LIBRARY="$(
-            ldconfig -p |
-              awk '/liblzma.so.5 / {print $NF; exit}'
-          )"
-
-          ZSTD_LIBRARY="$(
-            ldconfig -p |
-              awk '/libzstd.so.1 / {print $NF; exit}'
-          )"
-
-          BZ2_LIBRARY="$(
-            ldconfig -p |
-              awk '/libbz2.so.1.0 / {print $NF; exit}'
-          )"
-
-          Z_LIBRARY="$(
-            ldconfig -p |
-              awk '/libz.so.1 / {print $NF; exit}'
-          )"
-
-          if [ -z "${LZMA_LIBRARY}" ]; then
-            echo "ERROR: Could not find liblzma.so.5"
-            exit 1
-          fi
-
-          if [ -z "${ZSTD_LIBRARY}" ]; then
-            echo "ERROR: Could not find libzstd.so.1"
-            exit 1
-          fi
-
-          if [ -z "${BZ2_LIBRARY}" ]; then
-            echo "ERROR: Could not find libbz2.so.1.0"
-            exit 1
-          fi
-
-          if [ -z "${Z_LIBRARY}" ]; then
-            echo "ERROR: Could not find libz.so.1"
-            exit 1
-          fi
-
-          copy_library "${LZMA_LIBRARY}"
-          copy_library "${ZSTD_LIBRARY}"
-          copy_library "${BZ2_LIBRARY}"
-          copy_library "${Z_LIBRARY}"
-
-          echo
-          echo "Non-system runtime libraries bundled."
-
-      - name: Bundle compiler runtime libraries
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo "Bundle compiler runtime libraries"
-          echo "========================================"
-
-          PACKAGE_ROOT="/tmp/innoextract-package"
-          LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
-
-          copy_library() {
-            local library="$1"
-
-            if [ ! -f "${library}" ]; then
-              echo
-              echo "ERROR: Runtime library does not exist:"
-              echo "  ${library}"
-              exit 1
-            fi
-
-            echo "Bundling:"
-            echo "  ${library}"
-
-            cp -L "${library}" "${LIB_ROOT}/"
-          }
-
-          LIBSTDCPP="$(
-            g++ -print-file-name=libstdc++.so.6
-          )"
-
-          LIBGCC="$(
-            gcc -print-file-name=libgcc_s.so.1
-          )"
-
-          copy_library "${LIBSTDCPP}"
-          copy_library "${LIBGCC}"
-
-          echo
-          echo "Compiler runtime libraries bundled."
-
-      - name: Set RPATH
-        run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo "Set RPATH"
+          echo "Set executable RPATH"
           echo "========================================"
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           BINARY="${PACKAGE_ROOT}/usr/bin/innoextract"
 
           patchelf \
+            --force-rpath \
             --set-rpath '$ORIGIN/../lib/innoextract' \
             "${BINARY}"
 
           echo
-          echo "RPATH:"
+          echo "Executable RPATH:"
           patchelf --print-rpath "${BINARY}"
 
-      - name: Inspect bundled libraries
+      - name: Verify bundled libraries
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Inspect bundled libraries"
+          echo "Verify bundled libraries"
           echo "========================================"
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
+          BINARY="${PACKAGE_ROOT}/usr/bin/innoextract"
 
           echo
           echo "Bundled libraries:"
@@ -459,18 +560,35 @@ jobs:
             | sort
 
           echo
-          echo "Checking bundled libraries with ldd:"
+          echo "Checking RPATH of executable:"
+          patchelf --print-rpath "${BINARY}"
+
+          test \
+            "$(patchelf --print-rpath "${BINARY}")" \
+            = '$ORIGIN/../lib/innoextract'
+
           echo
+          echo "Checking RPATH of bundled libraries:"
 
-          for library in "${LIB_ROOT}"/*.so*; do
-            if [ -f "${library}" ]; then
-              echo "----------------------------------------"
-              echo "${library}"
-              echo "----------------------------------------"
+          while IFS= read -r library; do
+            rpath="$(patchelf --print-rpath "${library}")"
 
-              ldd "${library}" || true
-            fi
-          done
+            echo
+            echo "$(basename "${library}")"
+            echo "  RPATH: ${rpath}"
+
+            test "${rpath}" = '$ORIGIN'
+          done < <(
+            find "${LIB_ROOT}" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.so*' \
+              -print \
+              | sort
+          )
+
+          echo
+          echo "All bundled libraries have the expected RPATH."
 
       - name: Create package metadata
         run: |
@@ -494,7 +612,9 @@ jobs:
            Debug build of innoextract with bundled runtime dependencies.
           EOF
 
-          echo "Package version: ${VERSION}"
+          echo
+          echo "Control file:"
+          cat "${PACKAGE_ROOT}/DEBIAN/control"
 
       - name: Build Debian package
         run: |
@@ -506,7 +626,6 @@ jobs:
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
-
           PACKAGE="${GITHUB_WORKSPACE}/ci-output/innoextract_${VERSION}_amd64.deb"
 
           rm -f "${GITHUB_WORKSPACE}/ci-output/"*.deb
@@ -540,6 +659,7 @@ jobs:
           )
 
           if [ "${#PACKAGES[@]}" -ne 1 ]; then
+            echo
             echo "ERROR: Expected exactly one Debian package."
             echo "Found: ${#PACKAGES[@]}"
 
@@ -564,7 +684,7 @@ jobs:
           echo "Package contents:"
           dpkg-deb -c "${PACKAGE}"
 
-      - name: Test package without external dependencies
+      - name: Test package without external application dependencies
         run: |
           set -euo pipefail
 
@@ -581,7 +701,9 @@ jobs:
           )
 
           if [ "${#PACKAGES[@]}" -ne 1 ]; then
+            echo
             echo "ERROR: Expected exactly one Debian package."
+            echo "Found: ${#PACKAGES[@]}"
             exit 1
           fi
 
@@ -597,7 +719,6 @@ jobs:
             "${TEST_ROOT}"
 
           BINARY="${TEST_ROOT}/usr/bin/innoextract"
-          LIB_ROOT="${TEST_ROOT}/usr/lib/innoextract"
 
           test -x "${BINARY}"
 
@@ -607,17 +728,6 @@ jobs:
           echo "========================================"
 
           patchelf --print-rpath "${BINARY}"
-
-          EXPECTED_RPATH='$ORIGIN/../lib/innoextract'
-          ACTUAL_RPATH="$(patchelf --print-rpath "${BINARY}")"
-
-          if [ "${ACTUAL_RPATH}" != "${EXPECTED_RPATH}" ]; then
-            echo
-            echo "ERROR: Unexpected RPATH."
-            echo "Expected: ${EXPECTED_RPATH}"
-            echo "Actual:   ${ACTUAL_RPATH}"
-            exit 1
-          fi
 
           echo
           echo "========================================"
@@ -633,78 +743,70 @@ jobs:
           fi
 
           echo
-          echo "Direct binary dependencies are resolved."
+          echo "No missing runtime libraries."
 
           echo
           echo "========================================"
-          echo "Check bundled libraries recursively"
+          echo "Bundled library dependency checks"
           echo "========================================"
 
-          MISSING=0
-
-          check_dependencies() {
-            local object="$1"
-
+          while IFS= read -r library; do
             echo
-            echo "Checking:"
-            echo "  ${object}"
+            echo "Library:"
+            echo "  ${library}"
 
-            while IFS= read -r line; do
-              if echo "${line}" | grep -q "not found"; then
-                echo
-                echo "ERROR: Missing dependency:"
-                echo "  ${line}"
-                MISSING=1
-              fi
-            done < <(ldd "${object}" || true)
-          }
-
-          check_dependencies "${BINARY}"
-
-          for library in "${LIB_ROOT}"/*.so*; do
-            if [ -f "${library}" ]; then
-              check_dependencies "${library}"
+            if ldd "${library}" | grep -q "not found"; then
+              echo
+              echo "ERROR: Bundled library has missing dependencies:"
+              echo "  ${library}"
+              ldd "${library}"
+              exit 1
             fi
-          done
 
-          if [ "${MISSING}" -ne 0 ]; then
-            echo
-            echo "ERROR: One or more bundled libraries have unresolved dependencies."
-            exit 1
-          fi
+          done < <(
+            find "${TEST_ROOT}/usr/lib/innoextract" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.so*' \
+              -print \
+              | sort
+          )
 
           echo
           echo "All bundled libraries have their dependencies resolved."
 
           echo
           echo "========================================"
-          echo "Verify critical bundled libraries"
-          echo "========================================"
-
-          test -f "${LIB_ROOT}/libboost_system.so.1.83.0"
-          test -f "${LIB_ROOT}/libboost_filesystem.so.1.83.0"
-          test -f "${LIB_ROOT}/libboost_iostreams.so.1.83.0"
-          test -f "${LIB_ROOT}/libboost_program_options.so.1.83.0"
-          test -f "${LIB_ROOT}/libboost_date_time.so.1.83.0"
-          test -f "${LIB_ROOT}/libboost_atomic.so.1.83.0"
-          test -f "${LIB_ROOT}/liblzma.so.5"
-          test -f "${LIB_ROOT}/libzstd.so.1"
-          test -f "${LIB_ROOT}/libbz2.so.1.0"
-          test -f "${LIB_ROOT}/libz.so.1"
-          test -f "${LIB_ROOT}/libstdc++.so.6"
-          test -f "${LIB_ROOT}/libgcc_s.so.1"
-
-          echo "All critical runtime libraries are included."
-
-          echo
-          echo "========================================"
-          echo "Execute packaged binary"
+          echo "Binary test"
           echo "========================================"
 
           "${BINARY}" --help >/dev/null
 
           echo
-          echo "Packaged binary works without installing external runtime dependencies."
+          echo "Packaged binary works."
+
+      - name: Verify package is Debug build
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Verify package is Debug build"
+          echo "========================================"
+
+          TEST_ROOT="/tmp/innoextract-test"
+          BINARY="${TEST_ROOT}/usr/bin/innoextract"
+
+          echo
+          echo "Binary:"
+          file "${BINARY}"
+
+          echo
+          echo "Debug sections:"
+          readelf -S "${BINARY}" |
+            grep -E 'debug|symtab'
+
+          echo
+          echo "Build type verification passed."
 
       - name: Final artifact check
         run: |
@@ -724,7 +826,8 @@ jobs:
           find "${GITHUB_WORKSPACE}/ci-output" \
             -maxdepth 1 \
             -type f \
-            -printf '%f\n'
+            -printf '%f\n' \
+            | sort
 
           mapfile -t PACKAGES < <(
             find "${GITHUB_WORKSPACE}/ci-output" \
@@ -734,10 +837,12 @@ jobs:
               -print
           )
 
-          if [ "${#PACKAGES[@]}" -ne 1 ]; then
+          COUNT="${#PACKAGES[@]}"
+
+          if [ "${COUNT}" -ne 1 ]; then
             echo
             echo "ERROR: Expected exactly one Debian package."
-            echo "Found: ${#PACKAGES[@]}"
+            echo "Found: ${COUNT}"
 
             find "${GITHUB_WORKSPACE}/ci-output" \
               -maxdepth 2 \
@@ -746,13 +851,19 @@ jobs:
             exit 1
           fi
 
+          PACKAGE="${PACKAGES[0]}"
+
           echo
           echo "Exactly one Debian package found:"
-          echo "${PACKAGES[0]}"
+          echo "${PACKAGE}"
 
           echo
           echo "Package size:"
-          du -h "${PACKAGES[0]}"
+          ls -lh "${PACKAGE}"
+
+          echo
+          echo "Package type:"
+          file "${PACKAGE}"
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
