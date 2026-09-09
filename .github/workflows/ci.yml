@@ -9,7 +9,7 @@ on:
     branches:
       - master
   schedule:
-    - cron: '21 11 * * 5'
+    - cron: "21 11 * * 5"
 
 jobs:
   debian10:
@@ -31,7 +31,6 @@ jobs:
         shell: bash
 
     steps:
-
       # ------------------------------------------------------------
       # Checkout
       # ------------------------------------------------------------
@@ -586,14 +585,36 @@ jobs:
 
           PACKAGE_ROOT="/tmp/innoextract-package"
           BINARY="${PACKAGE_ROOT}/usr/bin/innoextract"
+          LIB_ROOT="${PACKAGE_ROOT}/usr/lib/innoextract"
 
           patchelf \
+            --force-rpath \
             --set-rpath '$ORIGIN/../lib/innoextract' \
             "${BINARY}"
 
           echo
           echo "RPATH:"
           patchelf --print-rpath "${BINARY}"
+
+          echo
+          echo "Setting library RPATH to \$ORIGIN..."
+
+          while IFS= read -r library; do
+            patchelf \
+              --force-rpath \
+              --set-rpath '$ORIGIN' \
+              "${library}"
+
+            printf '%s -> %s\n' \
+              "$(basename "${library}")" \
+              "$(patchelf --print-rpath "${library}")"
+          done < <(
+            find "${LIB_ROOT}" \
+              -maxdepth 1 \
+              -type f \
+              -print \
+              | sort
+          )
 
       # ------------------------------------------------------------
       # Package metadata
