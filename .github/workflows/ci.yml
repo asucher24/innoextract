@@ -1,3 +1,4 @@
+```yaml
 name: CI
 
 on:
@@ -29,10 +30,7 @@ jobs:
 
 
     # ============================================================
-    # Create build script.
-    #
-    # Keeping this in a separate file avoids nested shell quoting
-    # problems when running commands inside Docker.
+    # Create Debian build script
     # ============================================================
 
     - name: Create Debian build script
@@ -124,6 +122,15 @@ jobs:
 
         # ========================================================
         # Build Boost 1.83.0
+        #
+        # We intentionally build all Boost libraries.
+        #
+        # innoextract requires date_time in addition to
+        # iostreams, filesystem and program_options.
+        #
+        # Building everything avoids further missing-component
+        # problems if the CMake configuration requires another
+        # Boost library in the future.
         # ========================================================
 
         BOOST_VERSION="1.83.0"
@@ -145,18 +152,54 @@ jobs:
 
         cd "boost_${BOOST_VERSION_UNDERSCORE}"
 
+
+        echo
+        echo "========================================"
+        echo "Bootstrap Boost"
+        echo "========================================"
+
         ./bootstrap.sh \
           --prefix=/opt/boost
+
+
+        echo
+        echo "========================================"
+        echo "Build all Boost libraries"
+        echo "========================================"
 
         ./b2 \
           -j"$(nproc)" \
           --prefix=/opt/boost \
-          --with-iostreams \
-          --with-filesystem \
-          --with-program_options \
           link=shared \
           runtime-link=shared \
           install
+
+
+        echo
+        echo "========================================"
+        echo "Boost installation"
+        echo "========================================"
+
+        find /opt/boost \
+          -maxdepth 4 \
+          -type f \
+          | sort
+
+
+        # ========================================================
+        # Verify required Boost libraries.
+        # ========================================================
+
+        echo
+        echo "========================================"
+        echo "Verify Boost libraries"
+        echo "========================================"
+
+        find /opt/boost/lib \
+          -maxdepth 1 \
+          -type f \
+          -name 'libboost_*.so*' \
+          | sort
 
 
         # ========================================================
@@ -229,7 +272,7 @@ jobs:
 
 
         # ========================================================
-        # Prepare package
+        # Prepare Debian package
         # ========================================================
 
         echo
@@ -256,7 +299,7 @@ jobs:
 
 
         # ========================================================
-        # Find all recursive runtime dependencies.
+        # Collect recursive runtime dependencies.
         # ========================================================
 
         echo
@@ -273,8 +316,8 @@ jobs:
         # ========================================================
         # Bundle runtime libraries.
         #
-        # glibc and the ELF loader remain system dependencies.
-        # Everything else is bundled into the package.
+        # glibc and the dynamic loader remain system dependencies.
+        # Everything else is bundled.
         # ========================================================
 
         echo
@@ -365,7 +408,7 @@ jobs:
 
 
         # ========================================================
-        # Debian package metadata.
+        # Create Debian control file.
         # ========================================================
 
         echo
@@ -431,7 +474,7 @@ jobs:
         echo "========================================"
         echo "BUILD SUCCESSFUL"
         echo "========================================"
-        SCRIPT
+SCRIPT
 
         chmod +x /tmp/build-debian10.sh
 
@@ -494,7 +537,7 @@ jobs:
             EOF
 
             cat > /etc/apt/apt.conf.d/99archive <<EOF
-            Acquire::Check-Valid-Until "false";
+            Acquire::Check-Valid-Until "false"
             EOF
 
             apt-get update
@@ -543,11 +586,15 @@ jobs:
             echo "========================================"
 
             if ldd /usr/bin/innoextract | grep -q "not found"; then
+
               echo
               echo "ERROR: Missing runtime libraries!"
               echo
+
               ldd /usr/bin/innoextract
+
               exit 1
+
             fi
 
             echo "All runtime libraries found."
@@ -564,9 +611,11 @@ jobs:
               echo
               echo "ERROR: Boost is not loaded from the package."
               echo
+
               ldd /usr/bin/innoextract
 
               exit 1
+
             fi
 
             echo "Bundled Boost libraries are being used."
@@ -646,11 +695,15 @@ jobs:
             echo "========================================"
 
             if ldd /usr/bin/innoextract | grep -q "not found"; then
+
               echo
               echo "ERROR: Missing runtime libraries!"
               echo
+
               ldd /usr/bin/innoextract
+
               exit 1
+
             fi
 
             echo "All runtime libraries found."
@@ -667,9 +720,11 @@ jobs:
               echo
               echo "ERROR: Boost is not loaded from the package."
               echo
+
               ldd /usr/bin/innoextract
 
               exit 1
+
             fi
 
             echo "Bundled Boost libraries are being used."
@@ -691,7 +746,7 @@ jobs:
 
 
     # ============================================================
-    # Upload final package.
+    # Upload final Debian package.
     # ============================================================
 
     - name: Upload Debian package
@@ -700,3 +755,4 @@ jobs:
         name: innoextract-debian-amd64
         path: ci-output/*.deb
         if-no-files-found: error
+```
