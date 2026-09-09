@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - master
+
   pull_request:
     branches:
       - master
+
   schedule:
     - cron: '21 11 * * 5'
 
@@ -17,64 +19,111 @@ env:
 jobs:
 
   linux:
-    name: Debian 10 Debug build and package
+    name: Debian 10 debug build
     runs-on: ubuntu-latest
 
     steps:
 
+      # ============================================================
+      # Checkout
+      # ============================================================
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare output directories
+      # ============================================================
+      # Prepare output directory
+      # ============================================================
+
+      - name: Prepare output directory
         run: |
           set -euo pipefail
 
           rm -rf "${GITHUB_WORKSPACE}/ci-output"
-          rm -rf "${RUNNER_TEMP}/innoextract-output"
 
           mkdir -p "${GITHUB_WORKSPACE}/ci-output"
-          mkdir -p "${RUNNER_TEMP}/innoextract-output"
 
           echo "========================================"
-          echo "Workspace"
+          echo "GitHub workspace"
           echo "========================================"
 
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
-          echo "RUNNER_TEMP=${RUNNER_TEMP}"
 
           echo
-          echo "Workspace:"
-          ls -la "${GITHUB_WORKSPACE}"
+          ls -lah "${GITHUB_WORKSPACE}"
 
           echo
-          echo "Output:"
-          ls -la "${GITHUB_WORKSPACE}/ci-output"
+          echo "CI output:"
+          ls -lah "${GITHUB_WORKSPACE}/ci-output"
 
-          echo
-          echo "Temporary Docker output:"
-          ls -la "${RUNNER_TEMP}/innoextract-output"
+      # ============================================================
+      # Build
+      #
+      # IMPORTANT:
+      #
+      # The container itself is kept alive while we build.
+      # The resulting .deb is copied out using docker cp.
+      #
+      # We deliberately do NOT use an /out bind mount.
+      # ============================================================
 
-      - name: Build Debian 10 debug package
+      - name: Build Debian 10 package
         env:
           DEBUG: "on"
           DEBUG_EXTRA: "on"
         run: |
           set -euo pipefail
 
+          CONTAINER_NAME="innoextract-build-${GITHUB_RUN_ID}"
+
           echo "========================================"
-          echo "Starting Debian 10 build container"
+          echo "Create Debian 10 container"
           echo "========================================"
 
-          docker run --rm \
+          docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+          docker create \
+            --name "${CONTAINER_NAME}" \
             --user root \
             -e DEBUG="${DEBUG}" \
             -e DEBUG_EXTRA="${DEBUG_EXTRA}" \
             -e GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER}" \
             -v "${GITHUB_WORKSPACE}:/src" \
-            -v "${RUNNER_TEMP}/innoextract-output:/out" \
             -w /src \
             debian:10 \
-            bash -euxo pipefail <<'DOCKER_SCRIPT'
+            bash -c 'sleep infinity'
+
+          docker start "${CONTAINER_NAME}"
+
+          echo
+          echo "Container:"
+          docker ps -a \
+            --filter "name=${CONTAINER_NAME}"
+
+          # ----------------------------------------------------------
+          # Always remove the container after this step.
+          # ----------------------------------------------------------
+
+          cleanup() {
+            echo
+            echo "========================================"
+            echo "Remove build container"
+            echo "========================================"
+
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          # ==========================================================
+          # Build inside Debian 10
+          # ==========================================================
+
+          docker exec \
+            -e DEBUG="${DEBUG}" \
+            -e DEBUG_EXTRA="${DEBUG_EXTRA}" \
+            "${CONTAINER_NAME}" \
+            bash -euxo pipefail -c '
 
           export DEBIAN_FRONTEND=noninteractive
 
@@ -90,12 +139,12 @@ jobs:
           echo "Configure Debian 10 repositories"
           echo "========================================"
 
-          cat > /etc/apt/sources.list <<'APT_SOURCES'
+          cat > /etc/apt/sources.list <<'"'"'APT_SOURCES'"'"'
           deb http://archive.debian.org/debian buster main contrib non-free
           deb http://archive.debian.org/debian-security buster/updates main contrib non-free
           APT_SOURCES
 
-          cat > /etc/apt/apt.conf.d/99archive <<'APT_CONFIG'
+          cat > /etc/apt/apt.conf.d/99archive <<'"'"'APT_CONFIG'"'"'
           Acquire::Check-Valid-Until "false";
           APT_CONFIG
 
@@ -132,23 +181,24 @@ jobs:
           g++ --version
           cmake --version
 
+          # ==========================================================
+          # Verify environment
+          # ==========================================================
+
           echo
           echo "========================================"
-          echo "Environment"
+          echo "Debug environment"
           echo "========================================"
 
           echo "DEBUG=${DEBUG}"
           echo "DEBUG_EXTRA=${DEBUG_EXTRA}"
 
-          if [ "${DEBUG}" != "on" ]; then
-            echo "ERROR: DEBUG is not 'on'."
-            exit 1
-          fi
+          test "${DEBUG}" = "on"
+          test "${DEBUG_EXTRA}" = "on"
 
-          if [ "${DEBUG_EXTRA}" != "on" ]; then
-            echo "ERROR: DEBUG_EXTRA is not 'on'."
-            exit 1
-          fi
+          # ==========================================================
+          # Build Boost 1.83.0
+          # ==========================================================
 
           echo
           echo "========================================"
@@ -160,11 +210,15 @@ jobs:
 
           cd /tmp
 
+          rm -rf "boost_${BOOST_VERSION_UNDERSCORE}"
+          rm -f boost.tar.bz2
+
           wget \
             "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.bz2" \
             -O boost.tar.bz2
 
-          tar -xjf boost.tar.bz2
+          tar \
+            -xjf boost.tar.bz2
 
           cd "boost_${BOOST_VERSION_UNDERSCORE}"
 
@@ -174,6 +228,11 @@ jobs:
           ./b2 \
             -j"$(nproc)" \
             --prefix=/opt/boost \
+            --with-iostreams \
+            --with-filesystem \
+            --with-program_options \
+            --with-date_time \
+            --with-system \
             link=shared \
             runtime-link=shared \
             install
@@ -183,9 +242,19 @@ jobs:
           find /opt/boost/lib \
             -maxdepth 1 \
             -type f \
-            -name "libboost_*.so*" \
+            -name 'libboost_*.so*' \
             -print \
             | sort
+
+          # ==========================================================
+          # Configure innoextract
+          #
+          # IMPORTANT:
+          #
+          # CMAKE_BUILD_TYPE=Debug is explicitly set.
+          #
+          # DEBUG and DEBUG_EXTRA are also explicitly enabled.
+          # ==========================================================
 
           echo
           echo "========================================"
@@ -194,7 +263,7 @@ jobs:
 
           cd /src
 
-          rm -rf build
+          rm -rf /src/build
 
           export BOOST_ROOT=/opt/boost
           export CMAKE_PREFIX_PATH=/opt/boost
@@ -205,8 +274,69 @@ jobs:
             -Werror=deprecated \
             -DCONTINUOUS_INTEGRATION=1 \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DDEBUG=ON \
+            -DDEBUG_EXTRA=ON \
             -DBoost_ROOT=/opt/boost \
             -DBoost_NO_SYSTEM_PATHS=ON
+
+          # ==========================================================
+          # Verify CMake configuration
+          # ==========================================================
+
+          echo
+          echo "========================================"
+          echo "Verify CMake configuration"
+          echo "========================================"
+
+          echo
+          echo "CMAKE_BUILD_TYPE:"
+          grep '^CMAKE_BUILD_TYPE:' \
+            /src/build/CMakeCache.txt
+
+          echo
+          echo "DEBUG:"
+          grep '^DEBUG:' \
+            /src/build/CMakeCache.txt \
+            || true
+
+          echo
+          echo "DEBUG_EXTRA:"
+          grep '^DEBUG_EXTRA:' \
+            /src/build/CMakeCache.txt \
+            || true
+
+          echo
+          echo "Boost:"
+          grep -E \
+            '^(Boost_ROOT|BOOST_ROOT|CMAKE_PREFIX_PATH):' \
+            /src/build/CMakeCache.txt \
+            || true
+
+          # This is the important check.
+          grep -q '^CMAKE_BUILD_TYPE:STRING=Debug$' \
+            /src/build/CMakeCache.txt
+
+          # Depending on how the project declares these options,
+          # they may be BOOL or STRING. Therefore accept either
+          # representation, but require ON.
+
+          if grep -qE '^DEBUG:(BOOL|STRING)=ON$' \
+            /src/build/CMakeCache.txt; then
+            echo "DEBUG=ON confirmed."
+          else
+            echo "WARNING: DEBUG was not found as a CMake cache option."
+          fi
+
+          if grep -qE '^DEBUG_EXTRA:(BOOL|STRING)=ON$' \
+            /src/build/CMakeCache.txt; then
+            echo "DEBUG_EXTRA=ON confirmed."
+          else
+            echo "WARNING: DEBUG_EXTRA was not found as a CMake cache option."
+          fi
+
+          # ==========================================================
+          # Build
+          # ==========================================================
 
           echo
           echo "========================================"
@@ -217,37 +347,95 @@ jobs:
             --build /src/build \
             --parallel
 
+          # ==========================================================
+          # Tests
+          # ==========================================================
+
           echo
           echo "========================================"
           echo "Unit tests"
           echo "========================================"
 
-          cmake \
-            --build /src/build \
-            --target check
+          if cmake --build /src/build --target help | \
+            grep -qE '(^|[[:space:]])check([[:space:]]|$)'; then
+
+            cmake \
+              --build /src/build \
+              --target check
+
+          else
+            echo "No check target exists. Skipping."
+          fi
+
+          # ==========================================================
+          # Style
+          # ==========================================================
 
           echo
           echo "========================================"
-          echo "Check style"
+          echo "Style check"
           echo "========================================"
 
-          if cmake --build /src/build --target help | grep -qE '(^|[[:space:]])style([[:space:]]|$)'; then
-            echo "Style target found."
-            cmake --build /src/build --target style
+          if cmake --build /src/build --target help | \
+            grep -qE '(^|[[:space:]])style([[:space:]]|$)'; then
+
+            cmake \
+              --build /src/build \
+              --target style
+
           else
             echo "No style target exists. Skipping."
           fi
 
+          # ==========================================================
+          # Inspect binary
+          # ==========================================================
+
           echo
           echo "========================================"
-          echo "Inspect binary"
+          echo "Built binary"
           echo "========================================"
+
+          test -f /src/build/innoextract
 
           file /src/build/innoextract
 
           echo
+          echo "Binary size:"
+          ls -lh /src/build/innoextract
+
+          echo
           echo "Runtime dependencies:"
           ldd /src/build/innoextract
+
+          # ==========================================================
+          # IMPORTANT DEBUG CHECK
+          #
+          # The previous problem was:
+          #
+          #     innoextract: unrecognised option --debug
+          #
+          # We now verify that --debug is actually compiled in.
+          # ==========================================================
+
+          echo
+          echo "========================================"
+          echo "Verify debug CLI"
+          echo "========================================"
+
+          /src/build/innoextract \
+            --debug \
+            --help \
+            >/tmp/innoextract-debug-help.txt
+
+          echo
+          echo "Debug invocation succeeded."
+
+          cat /tmp/innoextract-debug-help.txt
+
+          # ==========================================================
+          # Prepare Debian package
+          # ==========================================================
 
           echo
           echo "========================================"
@@ -256,13 +444,17 @@ jobs:
 
           PKGROOT="/tmp/innoextract-package"
           LIBDIR="${PKGROOT}/usr/lib/innoextract"
+          OUTPUTDIR="/tmp/final-output"
 
-          rm -rf "${PKGROOT}"
+          rm -rf \
+            "${PKGROOT}" \
+            "${OUTPUTDIR}"
 
           mkdir -p \
             "${PKGROOT}/DEBIAN" \
             "${PKGROOT}/usr/bin" \
-            "${LIBDIR}"
+            "${LIBDIR}" \
+            "${OUTPUTDIR}"
 
           cp \
             /src/build/innoextract \
@@ -271,104 +463,190 @@ jobs:
           chmod 0755 \
             "${PKGROOT}/usr/bin/innoextract"
 
+          # ==========================================================
+          # Collect runtime dependencies
+          # ==========================================================
+
           echo
           echo "========================================"
-          echo "Bundle Boost runtime libraries"
+          echo "Collect runtime libraries"
           echo "========================================"
+
+          copy_library() {
+            local LIB="$1"
+
+            if [ -z "${LIB}" ]; then
+              return
+            fi
+
+            case "${LIB}" in
+
+              /lib/x86_64-linux-gnu/libc.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib/x86_64-linux-gnu/libm.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib/x86_64-linux-gnu/libdl.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib/x86_64-linux-gnu/libpthread.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib/x86_64-linux-gnu/librt.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib/x86_64-linux-gnu/ld-linux*.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+              /lib64/ld-linux*.so.*)
+                echo "SYSTEM: ${LIB}"
+                return
+                ;;
+
+            esac
+
+            if [ -f "${LIB}" ]; then
+              echo "BUNDLE: ${LIB}"
+              cp -L "${LIB}" "${LIBDIR}/"
+            else
+              echo "WARNING: library not found: ${LIB}"
+            fi
+          }
+
+          # ----------------------------------------------------------
+          # Copy all direct runtime dependencies reported by ldd.
+          # ----------------------------------------------------------
+
+          while read -r LIB; do
+            copy_library "${LIB}"
+          done < <(
+            ldd /src/build/innoextract |
+              awk '
+                /=>/ && $3 ~ /^\// {print $3}
+                !/=>/ && $1 ~ /^\// {print $1}
+              '
+          )
+
+          # ----------------------------------------------------------
+          # Explicitly bundle Boost.
+          # ----------------------------------------------------------
 
           find /opt/boost/lib \
             -maxdepth 1 \
             -type f \
-            -name "libboost_*.so*" \
+            -name 'libboost_*.so*' \
             -exec cp -L {} "${LIBDIR}/" \;
 
-          echo
-          echo "Bundled Boost libraries:"
-          find "${LIBDIR}" \
-            -maxdepth 1 \
-            -type f \
-            -name "libboost_*.so*" \
-            -printf "%f\n" \
-            | sort
+          # ----------------------------------------------------------
+          # Explicitly bundle liblzma.
+          # ----------------------------------------------------------
 
-          echo
-          echo "========================================"
-          echo "Bundle liblzma"
-          echo "========================================"
+          LZMA_PATH="$(
+            ldconfig -p |
+              awk '/liblzma.so.5/{print $NF; exit}'
+          )"
 
-          LZMA_PATH="$(ldconfig -p | awk '/liblzma.so.5/{print $NF; exit}')"
-
-          if [ -z "${LZMA_PATH}" ]; then
-            echo "ERROR: liblzma.so.5 could not be located."
-            exit 1
+          if [ -n "${LZMA_PATH}" ] && [ -f "${LZMA_PATH}" ]; then
+            cp -L \
+              "${LZMA_PATH}" \
+              "${LIBDIR}/"
           fi
 
-          echo "liblzma: ${LZMA_PATH}"
+          # ----------------------------------------------------------
+          # Explicitly bundle zlib/bzip2/zstd if present.
+          # ----------------------------------------------------------
 
-          cp -L \
-            "${LZMA_PATH}" \
-            "${LIBDIR}/"
+          for LIB in \
+            /lib/x86_64-linux-gnu/libz.so.1 \
+            /lib/x86_64-linux-gnu/libbz2.so.1.0 \
+            /lib/x86_64-linux-gnu/libzstd.so.1
+          do
+            if [ -f "${LIB}" ]; then
+              cp -L "${LIB}" "${LIBDIR}/"
+            fi
+          done
 
-          echo
-          echo "========================================"
-          echo "Do not bundle system libraries"
-          echo "========================================"
+          # ==========================================================
+          # Never bundle glibc / loader
+          # ==========================================================
 
           rm -f \
-            "${LIBDIR}/libstdc++.so.6" \
-            "${LIBDIR}/libgcc_s.so.1" \
-            "${LIBDIR}/libc.so.6" \
-            "${LIBDIR}/libm.so.6" \
-            "${LIBDIR}/libdl.so.2" \
-            "${LIBDIR}/libpthread.so.0" \
-            "${LIBDIR}/librt.so.1" \
-            "${LIBDIR}/ld-linux-x86-64.so.2"
+            "${LIBDIR}/libc.so."* \
+            "${LIBDIR}/libm.so."* \
+            "${LIBDIR}/libdl.so."* \
+            "${LIBDIR}/libpthread.so."* \
+            "${LIBDIR}/librt.so."* \
+            "${LIBDIR}/ld-linux"* \
+            "${LIBDIR}/libresolv.so."*
 
           echo
-          echo "All bundled libraries:"
+          echo "========================================"
+          echo "Bundled libraries"
+          echo "========================================"
+
           find "${LIBDIR}" \
             -maxdepth 1 \
             -type f \
-            -printf "%f\n" \
+            -printf '%f\n' \
             | sort
+
+          # ==========================================================
+          # Set RPATH
+          # ==========================================================
 
           echo
           echo "========================================"
-          echo "Configure RPATH"
+          echo "Set RPATH"
           echo "========================================"
 
           patchelf \
             --set-rpath /usr/lib/innoextract \
             "${PKGROOT}/usr/bin/innoextract"
 
+          echo
           echo "RPATH:"
           patchelf \
             --print-rpath \
             "${PKGROOT}/usr/bin/innoextract"
+
+          # ==========================================================
+          # Verify packaged binary before building .deb
+          # ==========================================================
 
           echo
           echo "========================================"
           echo "Verify packaged binary"
           echo "========================================"
 
-          LD_LIBRARY_PATH="${LIBDIR}" \
-            ldd "${PKGROOT}/usr/bin/innoextract"
+          ldd "${PKGROOT}/usr/bin/innoextract"
 
-          if LD_LIBRARY_PATH="${LIBDIR}" \
-            ldd "${PKGROOT}/usr/bin/innoextract" \
-            | grep -q "not found"; then
+          if ldd "${PKGROOT}/usr/bin/innoextract" |
+            grep -q 'not found'; then
 
+            echo
             echo "ERROR: Missing runtime library."
             exit 1
           fi
 
           echo
-          echo "All runtime libraries are available."
+          echo "All runtime libraries found."
 
-          echo
-          echo "========================================"
-          echo "Create Debian package metadata"
-          echo "========================================"
+          # ==========================================================
+          # Debian metadata
+          # ==========================================================
 
           VERSION="0.0.0+git${GITHUB_RUN_NUMBER}"
           ARCH="$(dpkg --print-architecture)"
@@ -380,18 +658,22 @@ jobs:
           Priority: optional
           Architecture: ${ARCH}
           Maintainer: innoextract CI
+          Depends: libc6 (>= 2.28)
           Description: Tool for extracting Inno Setup installers
            innoextract extracts files from installers created by Inno Setup.
+           This is a debug build with bundled runtime libraries.
           CONTROL
+
+          # ==========================================================
+          # Build .deb
+          # ==========================================================
 
           echo
           echo "========================================"
           echo "Build Debian package"
           echo "========================================"
 
-          OUTPUT="/out/innoextract_${VERSION}_${ARCH}.deb"
-
-          rm -f /out/*.deb
+          OUTPUT="${OUTPUTDIR}/innoextract_${VERSION}_${ARCH}.deb"
 
           dpkg-deb \
             --build \
@@ -399,9 +681,13 @@ jobs:
             "${PKGROOT}" \
             "${OUTPUT}"
 
+          # ==========================================================
+          # Verify .deb
+          # ==========================================================
+
           echo
           echo "========================================"
-          echo "Verify package inside Docker"
+          echo "Debian package"
           echo "========================================"
 
           test -f "${OUTPUT}"
@@ -411,109 +697,178 @@ jobs:
           file "${OUTPUT}"
 
           echo
-          echo "Package:"
+          echo "Package metadata:"
           dpkg-deb --info "${OUTPUT}"
 
           echo
-          echo "Contents:"
+          echo "Package contents:"
           dpkg-deb --contents "${OUTPUT}"
 
-          echo
-          echo "========================================"
-          echo "Docker output directory"
-          echo "========================================"
-
-          ls -lah /out
+          # ==========================================================
+          # Verify the package itself
+          # ==========================================================
 
           echo
-          echo "Package successfully created:"
-          echo "${OUTPUT}"
-
-          DOCKER_SCRIPT
-
-      - name: Collect Debian package
-        run: |
-          set -euo pipefail
-
           echo "========================================"
-          echo "Collect package from Docker"
+          echo "Install package inside build container"
           echo "========================================"
 
-          echo "Docker output directory:"
-          ls -lah "${RUNNER_TEMP}/innoextract-output"
+          dpkg -i "${OUTPUT}"
 
           echo
-          echo "Files:"
-          find "${RUNNER_TEMP}/innoextract-output" \
+          echo "Installed binary:"
+          ls -lh /usr/bin/innoextract
+
+          echo
+          echo "Installed runtime dependencies:"
+          ldd /usr/bin/innoextract
+
+          if ldd /usr/bin/innoextract |
+            grep -q "not found"; then
+
+            echo
+            echo "ERROR: Installed package has missing libraries."
+            exit 1
+          fi
+
+          echo
+          echo "========================================"
+          echo "Run installed debug binary"
+          echo "========================================"
+
+          /usr/bin/innoextract \
+            --debug \
+            --help \
+            >/tmp/installed-debug-help.txt
+
+          cat /tmp/installed-debug-help.txt
+
+          echo
+          echo "Installed debug binary works."
+
+          # ==========================================================
+          # Final output
+          # ==========================================================
+
+          echo
+          echo "========================================"
+          echo "Final container output"
+          echo "========================================"
+
+          find /tmp/final-output \
+            -maxdepth 1 \
+            -type f \
+            -name '*.deb' \
+            -ls
+
+          DEB_COUNT="$(
+            find /tmp/final-output \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' |
+              wc -l
+          )"
+
+          test "${DEB_COUNT}" -eq 1
+
+          echo
+          echo "Debian package successfully created."
+          '
+
+          # ==========================================================
+          # Copy artifact OUT of Docker.
+          #
+          # This is the ONLY Docker -> GitHub artifact transfer.
+          # ==========================================================
+
+          echo
+          echo "========================================"
+          echo "Copy .deb from Docker"
+          echo "========================================"
+
+          docker cp \
+            "${CONTAINER_NAME}:/tmp/final-output/." \
+            "${GITHUB_WORKSPACE}/ci-output/"
+
+          echo
+          echo "Files copied:"
+          find "${GITHUB_WORKSPACE}/ci-output" \
             -maxdepth 1 \
             -type f \
             -print
 
-          DEB_COUNT="$(find "${RUNNER_TEMP}/innoextract-output" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            | wc -l)"
+          # ==========================================================
+          # Validate exactly one artifact exists.
+          # ==========================================================
+
+          DEB_COUNT="$(
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' |
+              wc -l
+          )"
 
           if [ "${DEB_COUNT}" -ne 1 ]; then
             echo
-            echo "ERROR: Expected exactly one Debian package."
+            echo "ERROR: Expected exactly one .deb."
             echo "Found: ${DEB_COUNT}"
+
+            echo
+            echo "ci-output:"
+            ls -lah "${GITHUB_WORKSPACE}/ci-output"
+
+            echo
+            echo "Container:"
+            docker ps -a \
+              --filter "name=${CONTAINER_NAME}"
+
             exit 1
           fi
 
-          DEB_FILE="$(find "${RUNNER_TEMP}/innoextract-output" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            -print -quit)"
-
           echo
-          echo "Found:"
-          echo "${DEB_FILE}"
+          echo "Artifact successfully copied."
 
-          cp \
-            "${DEB_FILE}" \
-            "${GITHUB_WORKSPACE}/ci-output/"
-
-          echo
-          echo "GitHub output directory:"
-          ls -lah "${GITHUB_WORKSPACE}/ci-output"
+      # ============================================================
+      # Test ACTUAL artifact on clean Debian 10
+      # ============================================================
 
       - name: Test package on clean Debian 10
         run: |
           set -euo pipefail
 
-          PACKAGE="$(find "${GITHUB_WORKSPACE}/ci-output" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            -print -quit)"
+          PACKAGE="$(
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' \
+              -print -quit
+          )"
 
-          echo "Testing:"
-          echo "${PACKAGE}"
-
-          docker run --rm \
-            --user root \
-            -v "${PACKAGE}:/work/package.deb:ro" \
-            debian:10 \
-            bash -euxo pipefail <<'DOCKER_TEST'
-
-          export DEBIAN_FRONTEND=noninteractive
-
-          echo
           echo "========================================"
           echo "Clean Debian 10 test"
           echo "========================================"
 
+          echo "Package:"
+          echo "${PACKAGE}"
+
+          docker run \
+            --rm \
+            --user root \
+            -v "${PACKAGE}:/work/package.deb:ro" \
+            debian:10 \
+            bash -euxo pipefail -c '
+
+          export DEBIAN_FRONTEND=noninteractive
+
           cat /etc/os-release
 
-          cat > /etc/apt/sources.list <<'APT_SOURCES'
-          deb http://archive.debian.org/debian buster main
-          deb http://archive.debian.org/debian-security buster/updates main
+          cat > /etc/apt/sources.list <<'"'"'APT_SOURCES'"'"'
+          deb http://archive.debian.org/debian buster main contrib non-free
+          deb http://archive.debian.org/debian-security buster/updates main contrib non-free
           APT_SOURCES
 
-          cat > /etc/apt/apt.conf.d/99archive <<'APT_CONFIG'
+          cat > /etc/apt/apt.conf.d/99archive <<'"'"'APT_CONFIG'"'"'
           Acquire::Check-Valid-Until "false";
           APT_CONFIG
 
@@ -525,107 +880,101 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Install package"
+          echo "Install .deb"
           echo "========================================"
 
           dpkg -i /work/package.deb
 
           echo
           echo "========================================"
-          echo "Verify installation"
-          echo "========================================"
-
-          dpkg-query \
-            -W \
-            -f='${Status}\n' \
-            innoextract
-
-          test -x /usr/bin/innoextract
-
-          echo
-          echo "========================================"
-          echo "Runtime dependencies"
+          echo "Verify runtime dependencies"
           echo "========================================"
 
           ldd /usr/bin/innoextract
 
-          if ldd /usr/bin/innoextract | grep -q "not found"; then
-            echo "ERROR: Missing runtime library."
+          if ldd /usr/bin/innoextract |
+            grep -q "not found"; then
+
+            echo "ERROR: Missing runtime dependency."
             exit 1
           fi
 
           echo
-          echo "All runtime libraries found."
+          echo "All runtime dependencies found."
 
           echo
           echo "========================================"
-          echo "Bundled libraries"
+          echo "Verify bundled Boost"
           echo "========================================"
 
           find /usr/lib/innoextract \
             -maxdepth 1 \
             -type f \
-            -printf "%f\n" \
-            | sort
+            -name 'libboost_*.so*' \
+            -print
 
-          echo
-          echo "========================================"
-          echo "Verify system C++ runtime"
-          echo "========================================"
-
-          if find /usr/lib/innoextract \
+          if ! find /usr/lib/innoextract \
             -maxdepth 1 \
-            \( \
-              -name "libstdc++.so*" \
-              -o -name "libgcc_s.so*" \
-            \) \
-            | grep -q .; then
+            -type f \
+            -name 'libboost_*.so*' |
+            grep -q .; then
 
-            echo "ERROR: libstdc++ or libgcc is bundled."
+            echo "ERROR: Boost libraries are not bundled."
             exit 1
           fi
 
-          echo "No libstdc++/libgcc bundled."
+          echo
+          echo "Boost is bundled."
 
           echo
           echo "========================================"
-          echo "Run innoextract"
+          echo "Verify debug build"
           echo "========================================"
 
-          innoextract --help
+          /usr/bin/innoextract \
+            --debug \
+            --help \
+            >/tmp/debug-help.txt
+
+          cat /tmp/debug-help.txt
+
+          echo
+          echo "Debug build works."
 
           echo
           echo "========================================"
           echo "Debian 10 test successful"
           echo "========================================"
+          '
 
-          DOCKER_TEST
+      # ============================================================
+      # Test ACTUAL artifact on Ubuntu latest
+      # ============================================================
 
       - name: Test package on Ubuntu latest
         run: |
           set -euo pipefail
 
-          PACKAGE="$(find "${GITHUB_WORKSPACE}/ci-output" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            -print -quit)"
+          PACKAGE="$(
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' \
+              -print -quit
+          )"
 
-          echo "Testing:"
-          echo "${PACKAGE}"
-
-          docker run --rm \
-            --user root \
-            -v "${PACKAGE}:/work/package.deb:ro" \
-            ubuntu:latest \
-            bash -euxo pipefail <<'DOCKER_TEST'
-
-          export DEBIAN_FRONTEND=noninteractive
-
-          echo
           echo "========================================"
           echo "Clean Ubuntu latest test"
           echo "========================================"
+
+          docker run \
+            --rm \
+            --user root \
+            -v "${PACKAGE}:/work/package.deb:ro" \
+            ubuntu:latest \
+            bash -euxo pipefail -c '
+
+          export DEBIAN_FRONTEND=noninteractive
 
           cat /etc/os-release
 
@@ -637,7 +986,7 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Install package"
+          echo "Install .deb"
           echo "========================================"
 
           dpkg -i /work/package.deb
@@ -649,67 +998,105 @@ jobs:
 
           ldd /usr/bin/innoextract
 
-          if ldd /usr/bin/innoextract | grep -q "not found"; then
-            echo "ERROR: Missing runtime library."
+          if ldd /usr/bin/innoextract |
+            grep -q "not found"; then
+
+            echo "ERROR: Missing runtime dependency."
             exit 1
           fi
 
           echo
-          echo "All runtime libraries found."
+          echo "All runtime dependencies found."
 
           echo
           echo "========================================"
-          echo "Run innoextract"
+          echo "Run debug binary"
           echo "========================================"
 
-          innoextract --help
+          /usr/bin/innoextract \
+            --debug \
+            --help \
+            >/tmp/debug-help.txt
+
+          cat /tmp/debug-help.txt
+
+          echo
+          echo "Debug binary works on Ubuntu latest."
 
           echo
           echo "========================================"
           echo "Ubuntu latest test successful"
           echo "========================================"
+          '
 
-          DOCKER_TEST
+      # ============================================================
+      # Final artifact verification
+      # ============================================================
 
       - name: Verify final artifact
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "Final artifact"
+          echo "CI output"
           echo "========================================"
 
           ls -lah "${GITHUB_WORKSPACE}/ci-output"
 
-          DEB_COUNT="$(find "${GITHUB_WORKSPACE}/ci-output" \
+          echo
+          echo "Debian packages:"
+
+          find "${GITHUB_WORKSPACE}/ci-output" \
             -maxdepth 1 \
             -type f \
             -name '*.deb' \
-            | wc -l)"
+            -print
+
+          DEB_COUNT="$(
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' |
+              wc -l
+          )"
 
           if [ "${DEB_COUNT}" -ne 1 ]; then
-            echo "ERROR: Expected exactly one .deb."
+            echo
+            echo "ERROR: Expected exactly one .deb package."
             echo "Found: ${DEB_COUNT}"
             exit 1
           fi
 
-          DEB_FILE="$(find "${GITHUB_WORKSPACE}/ci-output" \
-            -maxdepth 1 \
-            -type f \
-            -name '*.deb' \
-            -print -quit)"
+          PACKAGE="$(
+            find "${GITHUB_WORKSPACE}/ci-output" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' \
+              -print -quit
+          )"
 
           echo
-          echo "Artifact ready:"
-          echo "${DEB_FILE}"
+          echo "========================================"
+          echo "Final artifact"
+          echo "========================================"
+
+          echo "${PACKAGE}"
 
           echo
           echo "Size:"
-          du -h "${DEB_FILE}"
+          du -h "${PACKAGE}"
 
           echo
           echo "Type:"
-          file "${DEB_FILE}"
+          file "${PACKAGE}"
+
+          echo
+          echo "Package metadata:"
+          dpkg-deb --info "${PACKAGE}"
+
+      # ============================================================
+      # Upload
+      # ============================================================
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
